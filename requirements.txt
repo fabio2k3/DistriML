@@ -1,0 +1,11 @@
+# Versiones con las que se probó el esqueleto (Python 3.13).
+# Todos los nodos deben usar la MISMA versión de scikit-learn y numpy:
+# los checkpoints son pickles y el generador de números aleatorios debe coincidir.
+ray==2.60.0
+numpy==2.5.3
+scikit-learn==1.9.1
+fastapi==0.163.2
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+pydantic==2.13.5
+pytest==9.1.1
