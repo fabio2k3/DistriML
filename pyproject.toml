@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distriml"
+version = "0.1.0"
+description = "Plataforma distribuida de entrenamiento y serving de modelos (proyecto de Sistemas Distribuidos)"
+requires-python = ">=3.10"
+dependencies = [
+    "ray==2.60.0",
+    "numpy==2.5.3",
+    "scikit-learn==1.9.1",
+    "fastapi==0.163.2",
+    "uvicorn[standard]==0.54.0",
+    "httpx==0.28.1",
+    "pydantic==2.13.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[project.scripts]
+distriml = "distriml.client.cli:main"
+distriml-cluster = "distriml.cluster:main"
+
+[tool.setuptools.packages.find]
+include = ["distriml*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "ray: pruebas que arrancan un cluster Ray local (más lentas)",
+]
