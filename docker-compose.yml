@@ -1,0 +1,50 @@
+# Cluster DistriML: 1 nodo head (Ray + DB + API) y N nodos worker, todos con la misma imagen.
+#
+#   docker compose up -d --build --scale worker=3     # levanta head y 3 contenedores worker
+#   docker compose logs -f head                       # operaciones de toda la red (API, DB, workers)
+#   docker compose down                               # detiene y borra contenedores (conserva el volumen)
+#
+# Variables opcionales (en el entorno o en un archivo .env):
+#   DISTRIML_LOG_LEVEL=INFO|DEBUG    nivel de registro (por defecto INFO)
+#   ACTORS=3                         número de actores worker que crea el head (por defecto 3)
+
+x-ray-node: &ray-node
+  image: distriml:latest
+  build: .
+  shm_size: "1gb"                    # Ray usa /dev/shm; el valor por defecto de Docker (64 MB) da problemas
+
+services:
+  head:
+    <<: *ray-node
+    environment:
+      DISTRIML_LOG_LEVEL: ${DISTRIML_LOG_LEVEL:-INFO}
+      RAY_AUTH_MODE: disabled        # red interna de confianza: sin token de autenticación entre nodos
+    ports:
+      - "8080:8080"                  # API HTTP
+    volumes:
+      - distriml-data:/data          # CSV de la BD y artefactos
+    # El proceso principal es la aplicación: su salida es lo que muestra `docker compose logs head`.
+    command: >
+      sh -c "ray start --head --port=6379 --num-cpus=2 --resources='{\"db\": 1}' --include-dashboard=false &&
+      python -m distriml.cluster --ray-address=auto --workers ${ACTORS:-3} --data-dir /data --host 0.0.0.0"
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  worker:
+    <<: *ray-node
+    environment:
+      RAY_AUTH_MODE: disabled
+    depends_on:
+      head:
+        condition: service_healthy
+    command: >
+      sh -c "ray start --address=head:6379 --num-cpus=2 --resources='{\"worker\": 10}' --block"
+    # Sin política de reinicio a propósito: un worker que se mata con `docker kill` se queda caído
+    # hasta que se levanta con `docker start <contenedor>`, para poder probar los fallos.
+
+volumes:
+  distriml-data:
