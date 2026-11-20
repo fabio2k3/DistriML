@@ -18,8 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==9.1.1"]
-
+dev = ["pytest==9.1.1", "httpx2==2.13.1"]
 [project.scripts]
 distriml = "distriml.client.cli:main"
 distriml-cluster = "distriml.cluster:main"
