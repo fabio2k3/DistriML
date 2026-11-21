@@ -8,7 +8,8 @@ nada sobre el estado de los jobs: la DB manda, y si la DB revoca su attempt, el 
 |---|---|
 | `worker.py` | Clase `Worker`: registro, bucle de trabajo en un hilo, estado consultable. |
 | `trainer.py` | `run_attempt` (un attempt completo), `download_artifact` y `LeaseKeeper` (hilo que renueva el lease). |
-| `main.py` | Crea los actores de Ray `worker-0 … worker-N` (ya hecho). |
+| `main.py` | Crea actores worker de Ray: `start_workers` (N locales) y `start_worker_on_this_node` (uno fijado a su nodo). Ya hecho. |
+| `node.py` | Proceso principal de un contenedor worker: se une a la DB, crea el actor de su nodo y lo retira al recibir SIGTERM. Ya hecho. |
 
 ## Funcionalidades
 - **Bucle:** se registra en la DB y pide un job cada `request_poll_interval_ms`; si la DB no responde (503), espera y reintenta sin morir.
@@ -19,6 +20,13 @@ nada sobre el estado de los jobs: la DB manda, y si la DB revoca su attempt, el 
 - **Cierre:** evalúa el modelo sobre el dataset completo, sube el modelo final y llama a `complete_job`.
 - **Errores:** una excepción de entrenamiento se reporta con `report_failure`; un binario irrecuperable con `report_unavailable`.
 
+## Crecer y decrecer
+Cada contenedor worker ejecuta `node.py`: espera a la DB, crea un actor `Worker` con id `worker-<hostname>` fijado a su nodo y
+lo mantiene vivo. Levantar otro contenedor añade un worker; detenerlo lo retira (`stop()` y `ray.kill`). El bucle de
+`Worker` no necesita saber cuántos workers hay: solo pide trabajo a la DB.
+`Worker.stop()` debe además abortar el attempt en curso, para que la parada ordenada no deje un job colgado hasta que
+venza el lease (TODO(WK-6)).
+
 ## Lo que ya viene hecho (módulo `common`)
 Carga y estandarización del dataset, partición en batches, algoritmos con `partial_fit`, serialización de checkpoints y hash.
 
@@ -28,4 +36,6 @@ confirmado/rechazado, lease renovado/perdido, aborto, error, fin).
 
 ## Cómo probarlo
 Sin la DB real: `Worker("w0", FakeDB(), cfg, autostart=False)`; `tests/helpers/reference_worker.py` muestra el flujo sin fallos.
-Con Ray: `python -m distriml.cluster --workers 2` y `python scripts/chaos.py kill-worker 0` para matar un worker a mitad de un job.
+Con Ray en una máquina: `python -m distriml.cluster --workers 2` y `python scripts/chaos.py kill-worker 0` para matar un worker a mitad de un job.
+Como nodo aparte: `python -m distriml.worker.node --worker-id worker-x` contra un cluster ya levantado; Ctrl+C lo retira.
+Con contenedores: ver `docs/DOCKER.md`.
