@@ -3,7 +3,8 @@
 Validan el pegamento de Ray, no la lógica de la BD:
   - el actor de la DB (esqueleto) arranca, responde y se REINICIA tras ser matado
   - ContractError cruza la frontera de Ray intacto (status/reason) y un actor caído => 503 no_ca
-  - los workers se crean como actores nombrados
+  - los workers se crean como actores nombrados y se reinician
+  - un nodo worker crea su actor fijado a su nodo y lo retira al pararse
   - flujo completo con FakeDB como actor + worker de referencia + gateway (mismo cableado que cluster.py)
 """
 import os
@@ -20,7 +21,8 @@ ROOT = str(Path(__file__).resolve().parent.parent)
 def ray_ctx():
     os.environ["PYTHONPATH"] = ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")   # antes de ray.init
     import ray
-    ray.init(namespace="distriml-test", include_dashboard=False, logging_level="ERROR", num_cpus=4)
+    ray.init(namespace="distriml-test", include_dashboard=False, logging_level="ERROR", num_cpus=4,
+             resources={"db": 1})                  # recurso que declara el nodo head en un cluster real
     yield ray
     ray.shutdown()
 
@@ -76,6 +78,43 @@ def test_workers_are_named_actors_and_restart(ray_ctx, tmp_path):
     else:
         pytest.fail("el worker no volvió tras el reinicio")
     assert len(workers) == 2
+
+
+def test_worker_node_creates_and_retires_its_actor(ray_ctx, tmp_path):
+    """worker/node.py: crea el actor del nodo, y al recibir la señal de parada lo retira."""
+    import threading
+
+    ray = ray_ctx
+    from distriml.common.config import load_config
+    from distriml.db.main import start_db
+    from distriml.worker import node
+
+    cfg = load_config(data_dir=tmp_path, ray_namespace="distriml-test", db_actor_name="db-test3")
+    db = start_db(cfg)                                   # conservar el handle
+    stop = threading.Event()
+    t = threading.Thread(target=node.run, args=(cfg, "worker-nodo-test", stop, None), daemon=True)
+    t.start()
+    actor = None
+    for _ in range(60):
+        try:
+            actor = ray.get_actor("worker-nodo-test", namespace="distriml-test")
+            break
+        except ValueError:
+            time.sleep(0.5)
+    assert actor is not None, "el nodo no creó su actor worker"
+    assert ray.get(actor.status.remote())["worker_id"] == "worker-nodo-test"
+    stop.set()
+    t.join(timeout=30)
+    assert not t.is_alive()
+    for _ in range(40):                                  # el actor debe haber desaparecido
+        try:
+            ray.get_actor("worker-nodo-test", namespace="distriml-test")
+            time.sleep(0.5)
+        except ValueError:
+            break
+    else:
+        pytest.fail("el actor no fue retirado")
+    assert db is not None
 
 
 def test_full_flow_with_fakedb_actor(ray_ctx, tmp_path):
