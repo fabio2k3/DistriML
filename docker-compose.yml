@@ -1,12 +1,14 @@
 # Cluster DistriML: 1 nodo head (Ray + DB + API) y N nodos worker, todos con la misma imagen.
 #
-#   docker compose up -d --build --scale worker=3     # levanta head y 3 contenedores worker
-#   docker compose logs -f head                       # operaciones de toda la red (API, DB, workers)
+#   docker compose up -d --build --scale worker=3     # head y 3 contenedores worker
+#   docker compose up -d --scale worker=5             # crecer: añade 2 workers sin tocar el resto
+#   docker compose up -d --scale worker=2             # decrecer: retira 3 workers
+#   docker compose logs -f head                       # API y DB
+#   docker compose logs -f worker                     # eventos de los workers
 #   docker compose down                               # detiene y borra contenedores (conserva el volumen)
 #
-# Variables opcionales (en el entorno o en un archivo .env):
-#   DISTRIML_LOG_LEVEL=INFO|DEBUG    nivel de registro (por defecto INFO)
-#   ACTORS=3                         número de actores worker que crea el head (por defecto 3)
+# Cada contenedor worker se une al cluster y crea su propio actor worker (distriml.worker.node).
+# Variable opcional (entorno o archivo .env): DISTRIML_LOG_LEVEL=INFO|DEBUG (por defecto INFO).
 
 x-ray-node: &ray-node
   image: distriml:latest
@@ -19,14 +21,16 @@ services:
     environment:
       DISTRIML_LOG_LEVEL: ${DISTRIML_LOG_LEVEL:-INFO}
       RAY_AUTH_MODE: disabled        # red interna de confianza: sin token de autenticación entre nodos
+      RAY_DEDUP_LOGS: "0"            # mostrar cada operación, sin agrupar líneas repetidas
     ports:
       - "8080:8080"                  # API HTTP
     volumes:
       - distriml-data:/data          # CSV de la BD y artefactos
-    # El proceso principal es la aplicación: su salida es lo que muestra `docker compose logs head`.
+    # El proceso principal es la aplicación (sin workers propios): su salida es lo que muestra `docker compose logs head`.
+    # El recurso `db` fija la DB en este nodo, que es donde está el volumen de datos.
     command: >
       sh -c "ray start --head --port=6379 --num-cpus=2 --resources='{\"db\": 1}' --include-dashboard=false &&
-      python -m distriml.cluster --ray-address=auto --workers ${ACTORS:-3} --data-dir /data --host 0.0.0.0"
+      exec python -m distriml.cluster --ray-address=auto --workers 0 --data-dir /data --host 0.0.0.0"
     healthcheck:
       test: ["CMD", "ray", "status"]
       interval: 5s
@@ -37,12 +41,18 @@ services:
   worker:
     <<: *ray-node
     environment:
+      DISTRIML_LOG_LEVEL: ${DISTRIML_LOG_LEVEL:-INFO}
       RAY_AUTH_MODE: disabled
+      RAY_DEDUP_LOGS: "0"
     depends_on:
       head:
         condition: service_healthy
+    # Proceso principal: distriml.worker.node (mantiene vivo el actor worker de este nodo).
+    # `exec` hace que reciba SIGTERM directamente cuando el contenedor se detiene y retire el worker ordenadamente.
     command: >
-      sh -c "ray start --address=head:6379 --num-cpus=2 --resources='{\"worker\": 10}' --block"
+      sh -c "ray start --address=head:6379 --num-cpus=2 &&
+      exec python -m distriml.worker.node --ray-address=auto"
+    stop_grace_period: 20s
     # Sin política de reinicio a propósito: un worker que se mata con `docker kill` se queda caído
     # hasta que se levanta con `docker start <contenedor>`, para poder probar los fallos.
 
