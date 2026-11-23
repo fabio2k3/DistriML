@@ -23,7 +23,7 @@ from distriml.common.config import Config
 from distriml.common.errors import ContractError
 from distriml.common.interfaces import DBService
 from distriml.common.log import get_logger, setup_logging
-
+from distriml.worker import trainer
 
 class Worker:
     def __init__(self, worker_id: str, db: DBService, cfg: Config, autostart: bool = True):
@@ -76,3 +76,55 @@ class Worker:
            self.log.warning / self.log.exception y seguir.
         """
         raise NotImplementedError("TODO(WK-1)")
+# ------------------------------------------------------------------ WK-1
+    def _register(self) -> bool:
+        """Se registra en la DB reintentando mientras responda 503 (p. ej. la DB se está reiniciando).
+
+        Devuelve True si quedó registrado y False si se pidió parar antes de conseguirlo.
+        """
+        poll = self.cfg.request_poll_interval_ms / 1000
+        while not self._stop.is_set():
+            try:
+                wc = self.db.register_worker(self.worker_id)
+                self.log.info("registrado en la DB (renovar cada %d ms, lease %d ms)",
+                              wc.renew_interval_ms, wc.lease_duration_ms)
+                return True
+            except ContractError as exc:
+                self.log.warning("no se pudo registrar (%s %s); reintento en %.1fs", exc.status, exc.reason, poll)
+            except Exception:  # noqa: BLE001  (el bucle no debe morir por un error inesperado)
+                self.log.exception("error inesperado al registrarse; reintento en %.1fs", poll)
+            self._stop.wait(poll)
+        return False
+
+    def _main_loop(self) -> None:
+        """Bucle principal: registro, y luego pedir un job, entrenarlo y repetir.
+
+        - Si la DB responde 503 (caída o reinicio) espera y reintenta; si la DB estaba caída
+          (`no_ca`) vuelve a registrarse, porque parte de su estado es volátil.
+        - Ninguna excepción mata el hilo: se registra y se sigue.
+        """
+        poll = self.cfg.request_poll_interval_ms / 1000
+        if not self._register():
+            return
+        while not self._stop.is_set():
+            try:
+                a = self.db.request_job(self.worker_id)
+                if a is None:
+                    self._stop.wait(poll)
+                    continue
+                self._current_attempt = a.attempt_id
+                self.log.info("job %s asignado: attempt %s, batches %d..%d de %d",
+                              a.job_id[:8], a.attempt_id[:8], a.next_batch, a.total_batches, a.total_batches)
+                try:
+                    result = trainer.run_attempt(a, self.worker_id, self.db, self.cfg)
+                    self.log.info("attempt %s terminado: %s", a.attempt_id[:8], result)
+                finally:
+                    self._current_attempt = None
+            except ContractError as exc:
+                self.log.warning("la DB respondió %s %s; reintento en %.1fs", exc.status, exc.reason, poll)
+                if exc.reason == "no_ca" and not self._register():
+                    return
+                self._stop.wait(poll)
+            except Exception:  # noqa: BLE001
+                self.log.exception("error inesperado en el bucle; sigo en %.1fs", poll)
+                self._stop.wait(poll)
