@@ -60,22 +60,6 @@ class Worker:
                 "running": bool(self._thread and self._thread.is_alive()),
                 "current_attempt": self._current_attempt}
 
-    # ------------------------------------------------------------------ por implementar
-    def _main_loop(self) -> None:
-        """TODO(WK-1) Bucle principal.
-
-        1. Registrarse: wc = self.db.register_worker(self.worker_id). Si la DB responde 503
-           (reiniciándose), reintentar con espera: el worker no debe morir por eso.
-        2. Mientras no esté `_stop`:
-             a = self.db.request_job(self.worker_id)
-             si a es None: dormir cfg.request_poll_interval_ms y continuar
-             si hay trabajo: self._current_attempt = a.attempt_id
-                              trainer.run_attempt(a, self.worker_id, self.db, self.cfg)
-                              self._current_attempt = None
-        3. Capturar ContractError (503) y errores inesperados sin matar el hilo: registrar con
-           self.log.warning / self.log.exception y seguir.
-        """
-        raise NotImplementedError("TODO(WK-1)")
 # ------------------------------------------------------------------ WK-1
     def _register(self) -> bool:
         """Se registra en la DB reintentando mientras responda 503 (p. ej. la DB se está reiniciando).
