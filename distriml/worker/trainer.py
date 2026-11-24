@@ -45,8 +45,7 @@ class ArtifactUnavailable(Exception):
         super().__init__(f"artefacto {sha256[:12]}… no disponible: {detail}")
         self.sha256 = sha256
 
-def download_artifact(db: DBService, sha256: str, abort: threading.Event, retries: int | None = None,
-                      base_delay: float | None = None, max_delay: float | None = None) -> bytes:
+def download_artifact(db: DBService, sha256: str, abort: threading.Event, retries: int | None = None, base_delay: float | None = None, max_delay: float | None = None) -> bytes:
     """Descarga con db.get_artifact y VERIFICA el sha256.
 
     - 503 de la DB o hash que no coincide: se reintenta con espera creciente (base_delay · 2^i, tope max_delay).
@@ -54,10 +53,12 @@ def download_artifact(db: DBService, sha256: str, abort: threading.Event, retrie
     - Si `abort` se activa (antes de un intento o durante una espera) -> AttemptAborted.
     - Agotados los `retries` reintentos -> ArtifactUnavailable.
     """
+
     retries = DOWNLOAD_RETRIES if retries is None else retries
     base_delay = DOWNLOAD_BASE_S if base_delay is None else base_delay
     max_delay = DOWNLOAD_MAX_S if max_delay is None else max_delay
     last = "sin intentos"
+
     for i in range(retries + 1):
         if abort.is_set():
             raise AttemptAborted("abortado durante la descarga")
@@ -78,6 +79,7 @@ def download_artifact(db: DBService, sha256: str, abort: threading.Event, retrie
         if abort.wait(delay):
             raise AttemptAborted("abortado durante la espera de un reintento de descarga")
     raise ArtifactUnavailable(sha256, last)
+
 
 @dataclass
 class Prepared:
@@ -102,6 +104,7 @@ def prepare_attempt(a: Assignment, db: DBService, abort: threading.Event, **down
     else:
         state = algorithms.init_state(a.algorithm, a.hyperparams, meta)
     return Prepared(meta, task, X, y, state)
+
 
 # Reintentos ante 503 (módulo-nivel para poder acortarlos en los tests)
 RETRY_BASE_S = 0.2          # espera inicial; se duplica en cada reintento
@@ -143,17 +146,18 @@ class LeaseKeeper(threading.Thread):
     - Termina cuando `done` se activa (el attempt acabó).
     """
 
-    def __init__(self, db: DBService, worker_id: str, attempt_id: str, cfg: Config,
-                 abort: threading.Event, done: threading.Event):
+    def __init__(self, db: DBService, worker_id: str, attempt_id: str, cfg: Config, abort: threading.Event, done: threading.Event):
         super().__init__(name=f"lease-{attempt_id[:8]}", daemon=True)
         self.db, self.worker_id, self.attempt_id, self.cfg = db, worker_id, attempt_id, cfg
         self.abort, self.done = abort, done
         self.log = get_logger(f"worker.{worker_id}")
 
+
     def run(self) -> None:
         interval = self.cfg.renew_interval_ms / 1000
         lease = self.cfg.lease_duration_ms / 1000
         last_ok = time.monotonic()      # la DB abre el lease al crear el attempt: arranca «ahora»
+        
         while not self.done.is_set():
             sent = time.monotonic()
             result = None
@@ -163,24 +167,27 @@ class LeaseKeeper(threading.Thread):
                 self.log.warning("renovación de lease fallida (%s %s)", exc.status, exc.reason)
             except Exception:  # noqa: BLE001  (el hilo no debe morir: un fallo de red es una renovación perdida)
                 self.log.exception("error inesperado al renovar el lease")
+            
             if result == C.RENEW_REVOKED:
                 self.log.warning("attempt %s revocado por la DB: aborto", self.attempt_id[:8])
                 self.abort.set()
                 return
+            
             if result == C.RENEW_CONTINUE:
                 last_ok = sent
                 self.log.debug("lease renovado (attempt %s)", self.attempt_id[:8])
+            
             remaining = last_ok + lease - time.monotonic()
             if remaining <= 0:
                 self.log.error("lease local vencido (%.1fs sin renovar): aborto el attempt %s",
                                lease, self.attempt_id[:8])
                 self.abort.set()
                 return
+            
             self.done.wait(min(interval, remaining))      # despierta antes si el lease está a punto de vencer
 
 
-def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, state: dict,
-                        metrics: dict, abort: threading.Event) -> None:
+def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, state: dict, metrics: dict, abort: threading.Event) -> None:
     """Checkpoint en dos pasos: a) put_artifact del estado; b) upload_checkpoint.
 
     CKPT_CONFIRMED -> listo | CKPT_RETRY -> repite (a) y (b) con espera | CKPT_REJECTED -> AttemptAborted.
@@ -188,6 +195,7 @@ def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, 
     """
     blob = algorithms.serialize_state(state)
     sha = sha256_hex(blob)
+
     for i in range(CKPT_RETRY_COUNT + 1):
         _retry_unavailable(lambda: db.put_artifact(sha, blob), abort, f"guardar el checkpoint {k}")
         r = _retry_unavailable(lambda: db.upload_checkpoint(worker_id, attempt_id, k, sha, metrics),
@@ -199,7 +207,10 @@ def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, 
         _log.warning("checkpoint %d: la DB pide reintentar (aún no ve el binario) %d/%d", k, i + 1, CKPT_RETRY_COUNT)
         if abort.wait(min(RETRY_BASE_S * (2 ** i), RETRY_MAX_S)):
             raise AttemptAborted(f"abortado durante la espera del checkpoint {k}")
+        
     raise unavailable("no_confirm", f"la DB no confirmó el checkpoint {k} tras {CKPT_RETRY_COUNT} intentos")
+
+
 
 def _report(log, abort: threading.Event, what: str, fn) -> None:
     """Informa a la DB de un fallo del attempt (mejor esfuerzo): reintenta los 503 y, si no lo consigue,
@@ -212,6 +223,18 @@ def _report(log, abort: threading.Event, what: str, fn) -> None:
         pass
     except Exception as exc:  # noqa: BLE001
         log.warning("no se pudo %s (%s); el lease vencerá y el job se reasignará", what, exc)
+
+
+def _fail(log, abort: threading.Event, db: DBService, worker_id: str, a: Assignment, exc: Exception) -> str:
+    """Error del propio entrenamiento: se reporta con report_failure (cuenta para max_attempts)."""
+    if abort.is_set():               # ya estaba revocado: el error es una consecuencia, no el motivo
+        log.info("attempt %s abortado (con error posterior: %s)", a.attempt_id[:8], exc)
+        return "ABORTED"
+    msg = " ".join(f"{type(exc).__name__}: {exc}".split())[:MAX_ERROR_LEN]     # una línea, acotada
+    log.error("attempt %s FALLIDO: %s", a.attempt_id[:8], msg, exc_info=exc)
+    _report(log, abort, "reportar el fallo", lambda: db.report_failure(worker_id, a.attempt_id, msg))
+    return "FAILED"
+
 
 def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
     """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" (| "FAILED", ver WK-6).
