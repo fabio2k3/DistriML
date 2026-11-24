@@ -17,8 +17,9 @@ from __future__ import annotations
 import threading
 import numpy as np
 from dataclasses import dataclass
+import time
 
-from distriml.common import algorithms, dataset
+from distriml.common import algorithms, dataset, batching, constants as C
 from distriml.common.config import Config
 from distriml.common.interfaces import Assignment, DBService
 from distriml.common.dataset import DatasetMeta
@@ -94,18 +95,44 @@ def prepare_attempt(a: Assignment, db: DBService, abort: threading.Event, **down
         state = algorithms.init_state(a.algorithm, a.hyperparams, meta)
     return Prepared(meta, task, X, y, state)
 
+# Reintentos ante 503 (módulo-nivel para poder acortarlos en los tests)
+RETRY_BASE_S = 0.2          # espera inicial; se duplica en cada reintento
+RETRY_MAX_S = 4.0
+RETRY_COUNT = 8             # reintentos ante 503 de la DB
+CKPT_RETRY_COUNT = 10       # veces que se repite un checkpoint si la DB contesta CKPT_RETRY
+
+
+def _retry_unavailable(fn, abort: threading.Event, what: str):
+    """Ejecuta `fn()` reintentando con espera creciente mientras la DB responda 503.
+
+    Se interrumpe con AttemptAborted si `abort` se activa (antes de un intento o durante una espera).
+    Otros errores del contrato, o agotar los reintentos, se propagan tal cual.
+    """
+    for i in range(RETRY_COUNT + 1):
+        if abort.is_set():
+            raise AttemptAborted(f"abortado antes de {what}")
+        try:
+            return fn()
+        except ContractError as exc:
+            if exc.status != 503 or i == RETRY_COUNT:
+                raise
+            delay = min(RETRY_BASE_S * (2 ** i), RETRY_MAX_S)
+            _log.warning("%s: la DB respondió %s %s; reintento %d/%d en %.1fs",
+                         what, exc.status, exc.reason, i + 1, RETRY_COUNT, delay)
+        if abort.wait(delay):
+            raise AttemptAborted(f"abortado durante la espera de {what}")
+
 
 class LeaseKeeper(threading.Thread):
     """Hilo que renueva el lease del attempt cada cfg.renew_interval_ms, con independencia de lo que
     dure cada batch.
 
-    TODO(WK-3)
-      - Cada intervalo: r = db.renew_lease(worker_id, attempt_id)
-          RENEW_REVOKED -> `abort.set()` y terminar
-          503 / error de red -> seguir intentando; el lease local se mide DESDE EL ENVÍO de la última
-          renovación que tuvo éxito (reloj monotónico: time.monotonic()).
-      - Si pasa lease_duration_ms sin éxito -> `abort.set()` (la DB ya habrá dado por perdido el attempt).
-      - Parar cuando `done` esté activado (el attempt terminó).
+    - RENEW_REVOKED -> `abort.set()` y termina (el attempt ya no es el vigente).
+    - 503 / error de red / cualquier excepción -> sigue intentando en el siguiente intervalo.
+    - El lease local se mide DESDE EL ENVÍO de la última renovación con éxito (time.monotonic()):
+      si pasan lease_duration_ms sin éxito -> `abort.set()`. Así el worker se retira ANTES de que la DB
+      lo dé por perdido (lease + epsilon) y no queda un attempt «zombi» escribiendo.
+    - Termina cuando `done` se activa (el attempt acabó).
     """
 
     def __init__(self, db: DBService, worker_id: str, attempt_id: str, cfg: Config,
@@ -113,40 +140,104 @@ class LeaseKeeper(threading.Thread):
         super().__init__(name=f"lease-{attempt_id[:8]}", daemon=True)
         self.db, self.worker_id, self.attempt_id, self.cfg = db, worker_id, attempt_id, cfg
         self.abort, self.done = abort, done
+        self.log = get_logger(f"worker.{worker_id}")
 
     def run(self) -> None:
-        raise NotImplementedError("TODO(WK-3)")
+        interval = self.cfg.renew_interval_ms / 1000
+        lease = self.cfg.lease_duration_ms / 1000
+        last_ok = time.monotonic()      # la DB abre el lease al crear el attempt: arranca «ahora»
+        while not self.done.is_set():
+            sent = time.monotonic()
+            result = None
+            try:
+                result = self.db.renew_lease(self.worker_id, self.attempt_id)
+            except ContractError as exc:
+                self.log.warning("renovación de lease fallida (%s %s)", exc.status, exc.reason)
+            except Exception:  # noqa: BLE001  (el hilo no debe morir: un fallo de red es una renovación perdida)
+                self.log.exception("error inesperado al renovar el lease")
+            if result == C.RENEW_REVOKED:
+                self.log.warning("attempt %s revocado por la DB: aborto", self.attempt_id[:8])
+                self.abort.set()
+                return
+            if result == C.RENEW_CONTINUE:
+                last_ok = sent
+                self.log.debug("lease renovado (attempt %s)", self.attempt_id[:8])
+            remaining = last_ok + lease - time.monotonic()
+            if remaining <= 0:
+                self.log.error("lease local vencido (%.1fs sin renovar): aborto el attempt %s",
+                               lease, self.attempt_id[:8])
+                self.abort.set()
+                return
+            self.done.wait(min(interval, remaining))      # despierta antes si el lease está a punto de vencer
+
+
+def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, state: dict,
+                        metrics: dict, abort: threading.Event) -> None:
+    """Checkpoint en dos pasos: a) put_artifact del estado; b) upload_checkpoint.
+
+    CKPT_CONFIRMED -> listo | CKPT_RETRY -> repite (a) y (b) con espera | CKPT_REJECTED -> AttemptAborted.
+    Si `abort` está activo NO se llama a la DB: un attempt revocado no escribe.
+    """
+    blob = algorithms.serialize_state(state)
+    sha = sha256_hex(blob)
+    for i in range(CKPT_RETRY_COUNT + 1):
+        _retry_unavailable(lambda: db.put_artifact(sha, blob), abort, f"guardar el checkpoint {k}")
+        r = _retry_unavailable(lambda: db.upload_checkpoint(worker_id, attempt_id, k, sha, metrics),
+                               abort, f"confirmar el checkpoint {k}")
+        if r == C.CKPT_CONFIRMED:
+            return
+        if r == C.CKPT_REJECTED:
+            raise AttemptAborted(f"checkpoint {k} rechazado: el attempt ya no es el vigente")
+        _log.warning("checkpoint %d: la DB pide reintentar (aún no ve el binario) %d/%d", k, i + 1, CKPT_RETRY_COUNT)
+        if abort.wait(min(RETRY_BASE_S * (2 ** i), RETRY_MAX_S)):
+            raise AttemptAborted(f"abortado durante la espera del checkpoint {k}")
+    raise RuntimeError(f"la DB no confirmó el checkpoint {k} tras {CKPT_RETRY_COUNT} intentos")
 
 
 def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
-    """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" | "FAILED".
+    """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" (| "FAILED", ver WK-6).
 
-    WK-2 (HECHO en `prepare_attempt`) Preparación:
-      1. Lanzar LeaseKeeper (hilo) con un `abort = threading.Event()`.
-      2. data = download_artifact(dataset); X, y = dataset.load_for_training(data, DatasetMeta.from_dict(a.dataset_meta), task)
-      3. Si a.next_batch > 1: state = deserialize_state(download_artifact(a.checkpoint_sha256));
-         si no: state = algorithms.init_state(a.algorithm, a.hyperparams, meta).
+    WK-2/WK-3  Lanza el LeaseKeeper ANTES de descargar (la DB cuenta el lease desde que crea el attempt),
+               y prepara datos y estado (`prepare_attempt`).
+    WK-4       Bucle de batches k = next_batch … total_batches, con checkpoint cada cfg.k_ckpt batches y en el último.
+    WK-5       Cierre: evaluate_full, put_artifact del modelo y complete_job.
+    SIEMPRE    Se para el LeaseKeeper (done.set()) por cualquier camino.
 
-    TODO(WK-4) Bucle de batches, para k = a.next_batch … a.total_batches:
-      - si abort está activo -> AttemptAborted (descartar el progreso no confirmado)
-      - idx = batching.batch_indices(n_rows, hp["batch_size"], hp["seed"], k)
-      - metrics = algorithms.train_batch(state, a.algorithm, X[idx], y[idx])
-      - si k % cfg.k_ckpt == 0 o k == total_batches: subir el checkpoint en dos pasos:
-            blob = serialize_state(state); sha = sha256_hex(blob)
-            db.put_artifact(sha, blob)                                          (paso a)
-            r = db.upload_checkpoint(worker_id, attempt_id, k, sha, metrics)    (paso b)
-            CKPT_CONFIRMED -> seguir | CKPT_RETRY -> reintentar con espera | CKPT_REJECTED -> AttemptAborted
-
-    TODO(WK-5) Cierre: final = algorithms.evaluate_full(state, algorithm, X, y);
-      subir el modelo final con put_artifact y llamar db.complete_job(worker_id, attempt_id, sha, final).
-
-    TODO(WK-6) Errores:
-      - excepción de entrenamiento (datos malformados, etc.) -> db.report_failure(worker_id, attempt_id, str(exc)); "FAILED"
-      - artefacto no disponible -> db.report_unavailable(...)
-      - SIEMPRE: parar el LeaseKeeper (done.set()) al terminar, por cualquier camino.
+    TODO(WK-6) Errores: excepción de entrenamiento -> db.report_failure y "FAILED"; ArtifactUnavailable ->
+      db.report_unavailable. Hasta entonces esas excepciones se propagan (el bucle del worker las registra).
     """
-    abort = threading.Event()          # lo activará el LeaseKeeper (WK-3)
-    prepared = prepare_attempt(a, db, abort)
-    _log.info("attempt %s preparado: %d filas, parte del batch %d de %d",
-              a.attempt_id[:8], len(prepared.y), a.next_batch, a.total_batches)
-    raise NotImplementedError("TODO(WK-3..6): lease, bucle de batches, cierre y errores")
+    log = get_logger(f"worker.{worker_id}")
+    abort, done = threading.Event(), threading.Event()
+    keeper = LeaseKeeper(db, worker_id, a.attempt_id, cfg, abort, done)
+    keeper.start()
+    try:
+        p = prepare_attempt(a, db, abort)
+        log.info("attempt %s: %d filas, batches %d..%d de %d",
+                 a.attempt_id[:8], len(p.y), a.next_batch, a.total_batches, a.total_batches)
+        hp = a.hyperparams
+        for k in range(a.next_batch, a.total_batches + 1):
+            if abort.is_set():
+                raise AttemptAborted("revocado o lease vencido; se descarta el progreso no confirmado")
+            idx = batching.batch_indices(p.meta.n_rows, hp["batch_size"], hp["seed"], k)
+            metrics = algorithms.train_batch(p.state, a.algorithm, p.X[idx], p.y[idx])
+            if k % cfg.k_ckpt == 0 or k == a.total_batches:
+                _confirm_checkpoint(db, worker_id, a.attempt_id, k, p.state, metrics, abort)
+                log.debug("batch %d/%d confirmado (score=%.3f)", k, a.total_batches, metrics["score"])
+        # ---- cierre (WK-5)
+        final = algorithms.evaluate_full(p.state, a.algorithm, p.X, p.y)
+        blob = algorithms.serialize_state(p.state)
+        sha = sha256_hex(blob)
+        _retry_unavailable(lambda: db.put_artifact(sha, blob), abort, "guardar el modelo final")
+        res = _retry_unavailable(lambda: db.complete_job(worker_id, a.attempt_id, sha, final), abort, "cerrar el job")
+        if res != C.COMPLETE_OK:
+            # Si la respuesta de un intento anterior se perdió, la DB puede haber cerrado ya el job: no es un error.
+            log.warning("complete_job devolvió %s: el attempt %s ya no es el vigente", res, a.attempt_id[:8])
+            return "ABORTED"
+        log.info("job %s COMPLETADO (attempt %s, %s)", a.job_id[:8], a.attempt_id[:8], final)
+        return "COMPLETED"
+    except AttemptAborted as exc:
+        log.info("attempt %s abortado: %s", a.attempt_id[:8], exc)
+        return "ABORTED"
+    finally:
+        done.set()
+        keeper.join(timeout=2.0)
