@@ -237,16 +237,21 @@ def _fail(log, abort: threading.Event, db: DBService, worker_id: str, a: Assignm
 
 
 def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
-    """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" (| "FAILED", ver WK-6).
+    """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" | "FAILED".
 
     WK-2/WK-3  Lanza el LeaseKeeper ANTES de descargar (la DB cuenta el lease desde que crea el attempt),
                y prepara datos y estado (`prepare_attempt`).
     WK-4       Bucle de batches k = next_batch … total_batches, con checkpoint cada cfg.k_ckpt batches y en el último.
     WK-5       Cierre: evaluate_full, put_artifact del modelo y complete_job.
+    WK-6       Errores y abortos. Qué se le dice a la DB según el origen del problema:
+                 - AttemptAborted (revocado, cancelado, lease vencido, checkpoint rechazado) -> nada; "ABORTED".
+                 - ArtifactUnavailable (no se pudo obtener un binario íntegro) -> report_unavailable; "ABORTED"
+                   (no cuenta para max_attempts: no es culpa del entrenamiento).
+                 - 503 que se agotó tras los reintentos (la DB no responde) -> nada: la DB no puede oírnos
+                   y el lease vencerá (WORKER_LOST); "ABORTED".
+                 - Cualquier otra excepción (datos corruptos, error del algoritmo, 400…) -> report_failure; "FAILED".
+               Un attempt ya revocado NO reporta nada (la DB lo rechazaría y podría pisar al sucesor).
     SIEMPRE    Se para el LeaseKeeper (done.set()) por cualquier camino.
-
-    TODO(WK-6) Errores: excepción de entrenamiento -> db.report_failure y "FAILED"; ArtifactUnavailable ->
-      db.report_unavailable. Hasta entonces esas excepciones se propagan (el bucle del worker las registra).
     """
     log = get_logger(f"worker.{worker_id}")
     abort, done = threading.Event(), threading.Event()
@@ -280,6 +285,20 @@ def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> st
     except AttemptAborted as exc:
         log.info("attempt %s abortado: %s", a.attempt_id[:8], exc)
         return "ABORTED"
+    except ArtifactUnavailable as exc:
+        log.error("attempt %s: %s", a.attempt_id[:8], exc)
+        if not abort.is_set():
+            _report(log, abort, "avisar de que falta un artefacto",
+                    lambda: db.report_unavailable(worker_id, a.attempt_id, exc.sha256))
+        return "ABORTED"
+    except ContractError as exc:
+        if exc.status == 503:        # la DB no respondió tras los reintentos
+            log.error("attempt %s: la DB no responde (%s %s); lo abandono y dejo que venza el lease",
+                      a.attempt_id[:8], exc.status, exc.reason)
+            return "ABORTED"
+        return _fail(log, abort, db, worker_id, a, exc)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(log, abort, db, worker_id, a, exc)
     finally:
         done.set()
         keeper.join(timeout=2.0)
