@@ -23,7 +23,7 @@ from distriml.common import algorithms, dataset, batching, constants as C
 from distriml.common.config import Config
 from distriml.common.interfaces import Assignment, DBService
 from distriml.common.dataset import DatasetMeta
-from distriml.common.errors import ContractError
+from distriml.common.errors import ContractError, unavailable
 from distriml.common.ids import sha256_hex
 from distriml.common.log import get_logger
 
@@ -33,6 +33,11 @@ class AttemptAborted(Exception):
     """El attempt fue revocado (RENEW_REVOKED / CKPT_REJECTED) o el lease local venció:
     se abandona sin reportar error."""
 
+DOWNLOAD_RETRIES = 5        # reintentos de descarga de un artefacto
+DOWNLOAD_BASE_S = 0.5
+DOWNLOAD_MAX_S = 8.0
+MAX_ERROR_LEN = 300         # longitud máxima del mensaje enviado en report_failure
+
 class ArtifactUnavailable(Exception):
     """No se pudo obtener un binario íntegro: `run_attempt` lo convertirá en db.report_unavailable (WK-6)."""
 
@@ -40,8 +45,8 @@ class ArtifactUnavailable(Exception):
         super().__init__(f"artefacto {sha256[:12]}… no disponible: {detail}")
         self.sha256 = sha256
 
-def download_artifact(db: DBService, sha256: str, abort: threading.Event, retries: int = 5,
-                      base_delay: float = 0.5, max_delay: float = 8.0) -> bytes:
+def download_artifact(db: DBService, sha256: str, abort: threading.Event, retries: int | None = None,
+                      base_delay: float | None = None, max_delay: float | None = None) -> bytes:
     """Descarga con db.get_artifact y VERIFICA el sha256.
 
     - 503 de la DB o hash que no coincide: se reintenta con espera creciente (base_delay · 2^i, tope max_delay).
@@ -49,6 +54,9 @@ def download_artifact(db: DBService, sha256: str, abort: threading.Event, retrie
     - Si `abort` se activa (antes de un intento o durante una espera) -> AttemptAborted.
     - Agotados los `retries` reintentos -> ArtifactUnavailable.
     """
+    retries = DOWNLOAD_RETRIES if retries is None else retries
+    base_delay = DOWNLOAD_BASE_S if base_delay is None else base_delay
+    max_delay = DOWNLOAD_MAX_S if max_delay is None else max_delay
     last = "sin intentos"
     for i in range(retries + 1):
         if abort.is_set():
@@ -191,7 +199,7 @@ def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, 
         _log.warning("checkpoint %d: la DB pide reintentar (aún no ve el binario) %d/%d", k, i + 1, CKPT_RETRY_COUNT)
         if abort.wait(min(RETRY_BASE_S * (2 ** i), RETRY_MAX_S)):
             raise AttemptAborted(f"abortado durante la espera del checkpoint {k}")
-    raise RuntimeError(f"la DB no confirmó el checkpoint {k} tras {CKPT_RETRY_COUNT} intentos")
+    raise unavailable("no_confirm", f"la DB no confirmó el checkpoint {k} tras {CKPT_RETRY_COUNT} intentos")
 
 
 def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
