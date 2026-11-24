@@ -201,6 +201,17 @@ def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, 
             raise AttemptAborted(f"abortado durante la espera del checkpoint {k}")
     raise unavailable("no_confirm", f"la DB no confirmó el checkpoint {k} tras {CKPT_RETRY_COUNT} intentos")
 
+def _report(log, abort: threading.Event, what: str, fn) -> None:
+    """Informa a la DB de un fallo del attempt (mejor esfuerzo): reintenta los 503 y, si no lo consigue,
+    solo lo registra: el lease acabará venciendo y la DB reasignará el job igualmente."""
+    if abort.is_set():
+        return
+    try:
+        _retry_unavailable(fn, abort, what)
+    except AttemptAborted:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("no se pudo %s (%s); el lease vencerá y el job se reasignará", what, exc)
 
 def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
     """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" (| "FAILED", ver WK-6).
