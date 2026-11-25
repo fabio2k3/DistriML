@@ -35,7 +35,8 @@ class Worker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_attempt: str | None = None
-        # Un actor reiniciado por Ray vuelve a ejecutar __init__: con autostart reanuda el bucle solo.
+        self._abort: threading.Event | None = None   # señal de aborto del attempt en curso
+        
         if autostart:
             self.start()
 
@@ -49,7 +50,15 @@ class Worker:
         self.log.info("worker iniciado")
 
     def stop(self) -> None:
+        """Retirada ordenada: para el bucle y ABORTA el attempt en curso (no espera a que termine el job).
+
+        El attempt abortado no escribe más en la DB; el job vuelve a estar disponible cuando vence su lease
+        y otro worker lo continúa desde el último checkpoint confirmado.
+        """
         self._stop.set()
+        abort = self._abort
+        if abort is not None:
+            abort.set()
         if self._thread:
             self._thread.join(timeout=5)
         self.log.info("worker detenido")
@@ -97,13 +106,18 @@ class Worker:
                     self._stop.wait(poll)
                     continue
                 self._current_attempt = a.attempt_id
+                abort = self._abort = threading.Event()
+                if self._stop.is_set():                      # stop() llegó entre la asignación y este punto
+                    abort.set()
                 self.log.info("job %s asignado: attempt %s, batches %d..%d de %d",
                               a.job_id[:8], a.attempt_id[:8], a.next_batch, a.total_batches, a.total_batches)
+                
                 try:
-                    result = trainer.run_attempt(a, self.worker_id, self.db, self.cfg)
+                    result = trainer.run_attempt(a, self.worker_id, self.db, self.cfg, abort=abort)
                     self.log.info("attempt %s terminado: %s", a.attempt_id[:8], result)
                 finally:
                     self._current_attempt = None
+                    self._abort = None
             except ContractError as exc:
                 self.log.warning("la DB respondió %s %s; reintento en %.1fs", exc.status, exc.reason, poll)
                 if exc.reason == "no_ca" and not self._register():
