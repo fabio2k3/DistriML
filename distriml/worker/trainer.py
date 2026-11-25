@@ -214,7 +214,8 @@ def _confirm_checkpoint(db: DBService, worker_id: str, attempt_id: str, k: int, 
 
 def _report(log, abort: threading.Event, what: str, fn) -> None:
     """Informa a la DB de un fallo del attempt (mejor esfuerzo): reintenta los 503 y, si no lo consigue,
-    solo lo registra: el lease acabará venciendo y la DB reasignará el job igualmente."""
+    solo lo registra: el lease acabará venciendo y la DB reasignará el job igualmente.
+    """
     if abort.is_set():
         return
     try:
@@ -230,13 +231,16 @@ def _fail(log, abort: threading.Event, db: DBService, worker_id: str, a: Assignm
     if abort.is_set():               # ya estaba revocado: el error es una consecuencia, no el motivo
         log.info("attempt %s abortado (con error posterior: %s)", a.attempt_id[:8], exc)
         return "ABORTED"
+    
     msg = " ".join(f"{type(exc).__name__}: {exc}".split())[:MAX_ERROR_LEN]     # una línea, acotada
     log.error("attempt %s FALLIDO: %s", a.attempt_id[:8], msg, exc_info=exc)
     _report(log, abort, "reportar el fallo", lambda: db.report_failure(worker_id, a.attempt_id, msg))
+
     return "FAILED"
 
 
-def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> str:
+
+def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config, abort: threading.Event | None = None) -> str:
     """Ejecuta un attempt completo. Devuelve "COMPLETED" | "ABORTED" | "FAILED".
 
     WK-2/WK-3  Lanza el LeaseKeeper ANTES de descargar (la DB cuenta el lease desde que crea el attempt),
@@ -252,16 +256,22 @@ def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> st
                  - Cualquier otra excepción (datos corruptos, error del algoritmo, 400…) -> report_failure; "FAILED".
                Un attempt ya revocado NO reporta nada (la DB lo rechazaría y podría pisar al sucesor).
     SIEMPRE    Se para el LeaseKeeper (done.set()) por cualquier camino.
+
+    `abort` (opcional) es la señal de aborto del attempt: la activan el LeaseKeeper (revocado / lease vencido)
+    y, desde fuera, `Worker.stop()` (retirada ordenada, hito 9). Si no se pasa, se crea una propia.
     """
     log = get_logger(f"worker.{worker_id}")
-    abort, done = threading.Event(), threading.Event()
+    abort = abort if abort is not None else threading.Event()
+    done = threading.Event()
     keeper = LeaseKeeper(db, worker_id, a.attempt_id, cfg, abort, done)
     keeper.start()
+
     try:
         p = prepare_attempt(a, db, abort)
         log.info("attempt %s: %d filas, batches %d..%d de %d",
                  a.attempt_id[:8], len(p.y), a.next_batch, a.total_batches, a.total_batches)
         hp = a.hyperparams
+
         for k in range(a.next_batch, a.total_batches + 1):
             if abort.is_set():
                 raise AttemptAborted("revocado o lease vencido; se descarta el progreso no confirmado")
@@ -270,12 +280,13 @@ def run_attempt(a: Assignment, worker_id: str, db: DBService, cfg: Config) -> st
             if k % cfg.k_ckpt == 0 or k == a.total_batches:
                 _confirm_checkpoint(db, worker_id, a.attempt_id, k, p.state, metrics, abort)
                 log.debug("batch %d/%d confirmado (score=%.3f)", k, a.total_batches, metrics["score"])
-        # ---- cierre (WK-5)
+
         final = algorithms.evaluate_full(p.state, a.algorithm, p.X, p.y)
         blob = algorithms.serialize_state(p.state)
         sha = sha256_hex(blob)
         _retry_unavailable(lambda: db.put_artifact(sha, blob), abort, "guardar el modelo final")
         res = _retry_unavailable(lambda: db.complete_job(worker_id, a.attempt_id, sha, final), abort, "cerrar el job")
+
         if res != C.COMPLETE_OK:
             # Si la respuesta de un intento anterior se perdió, la DB puede haber cerrado ya el job: no es un error.
             log.warning("complete_job devolvió %s: el attempt %s ya no es el vigente", res, a.attempt_id[:8])
