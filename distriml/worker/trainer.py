@@ -102,7 +102,7 @@ def prepare_attempt(a: Assignment, db: DBService, abort: threading.Event, **down
             raise ValueError(f"next_batch={a.next_batch} pero la asignación no trae checkpoint")
         state = algorithms.deserialize_state(download_artifact(db, a.checkpoint_sha256, abort, **download_kwargs))
     else:
-        state = algorithms.init_state(a.algorithm, a.hyperparams, meta)
+        state = algorithms.init_state(a.algorithm, a.hyperparams, meta, dataset.class_names_of(data))
     return Prepared(meta, task, X, y, state)
 
 
