@@ -14,7 +14,10 @@ solo necesita la URL del gateway (`--url` o `DISTRIML_URL`).
 
 ## Funcionalidades
 - **Identidad:** `distriml init <username>` crea un `client_id` aleatorio (SHA-256 de username + sal descartada). Si se pierde el archivo se pierde el acceso a los datos.
-- **Comandos:** `models`, `upload`, `datasets`, `submit --hp clave=valor`, `jobs`, `job --watch`, `cancel`, `metrics`, `versions`, `stats`, `predict`.
+- **Comandos:** `models` (`--mine`: tus modelos entrenados), `upload`, `datasets`, `submit --hp clave=valor`, `jobs`, `job --watch`, `cancel`, `metrics`, `versions`, `delete-version`, `stats`, `predict`.
+- **Etiquetas con nombre:** la última columna del CSV puede ser texto (`setosa`, `versicolor`...). Los nombres se numeran en orden alfabético (0, 1, 2...) y `predict` devuelve también `label` con el nombre de la clase; la consola lo muestra como `Predicción: 1 = versicolor`. Con etiquetas numéricas no cambia nada. Ejemplo: `data/samples/iris_names.csv`.
+- **Sin duplicados:** subir dos veces un dataset con el mismo contenido no crea otra copia: devuelve el existente con `already_existed: true`.
+- **Borrar versiones:** `delete-version MODEL_ID VERSION_ID` (o la opción 11 de la consola). Si era la única versión, el modelo desaparece y ya no se puede predecir con él; el job sigue COMPLETADO. No se puede deshacer.
 - **Reintentos seguros:** ante `503` o error de conexión repite la petición con el **mismo** `client_request_id`, de modo que no se duplican datasets ni jobs.
 - **Seguimiento de escrituras:** guarda el último `entry_id` recibido y lo reenvía en `X-Min-Entry`.
 - **Esperas:** `ApiClient.wait_job()` y `distriml job <id> --watch` consultan hasta que el job termina.
