@@ -102,6 +102,66 @@ def test_full_flow_train_predict_stats_versions(api, iris):
     assert api.version(done["model_id"], vs[0]["version_id"])["sha256"] == p["sha256"]
 
 
+def test_list_trained_models(api, iris):
+    _, _, done = _trained(api, iris)
+    mine = api.trained_models()
+    entry = next(m for m in mine if m["model_id"] == done["model_id"])
+    assert entry["job_id"] == done["job_id"] and entry["versions"] == 1
+    assert entry["canonical_version_id"] == done["canonical_version_id"] and entry["metrics"]["accuracy"] > 0.5
+    assert api.predict(entry["model_id"], [5.1, 3.5, 1.4, 0.2])["version_id"] == entry["canonical_version_id"]
+    assert [m["model_id"] for m in api.trained_models(limit=1)] == [mine[0]["model_id"]]
+
+
+def test_text_labels_are_answered_with_the_class_name(api):
+    data = (SAMPLES / "iris_names.csv").read_bytes()
+    ds = api.upload_dataset("iris_names.csv", data)
+    assert ds["class_names"] == ["setosa", "versicolor", "virginica"] and ds["classes"] == [0, 1, 2]
+    job = api.submit_job(ds["dataset_id"], _model(api, "sgd_logistic"), {"epochs": 5})
+    done = api.wait_job(job["job_id"], timeout=60)
+    assert done["estado"] == "COMPLETADO"
+    res = api.predict(done["model_id"], [5.1, 3.5, 1.4, 0.2])
+    assert res["label"] == ds["class_names"][res["prediction"]]
+    assert api.predict(done["model_id"], [5.1, 3.5, 1.4, 0.2], version=1)["label"] == res["label"]
+
+
+def test_uploading_the_same_content_again_reuses_the_dataset(api, iris):
+    first = api.upload_dataset("iris.csv", iris)
+    again = api.upload_dataset("iris-copia.csv", iris)                   # otro nombre y otro request_id, mismo contenido
+    assert again["dataset_id"] == first["dataset_id"] and again["already_existed"] is True
+    assert "already_existed" not in first
+    assert sum(1 for d in api.datasets() if d["dataset_id"] == first["dataset_id"]) == 1
+    assert len({d["sha256"] for d in api.datasets()}) == len(api.datasets())           # ningún contenido repetido
+
+
+def test_delete_a_model_version(api, iris):
+    from distriml.client.http import ApiError
+    _, job, done = _trained(api, iris)
+    model_id = done["model_id"]
+    (ver,) = api.versions(model_id)
+    res = api.delete_version(model_id, ver["version_id"], client_request_id="borrar-1")
+    assert res["deleted"] == ver["version_id"] and res["model_deleted"] is True and res["entry_id"]
+    assert api.delete_version(model_id, ver["version_id"], client_request_id="borrar-1") == res       # idempotente
+    assert all(m["model_id"] != model_id for m in api.trained_models())
+    for call in (lambda: api.predict(model_id, [5.1, 3.5, 1.4, 0.2]), lambda: api.versions(model_id),
+                 lambda: api.stats(model_id), lambda: api.delete_version(model_id, ver["version_id"])):
+        with pytest.raises(ApiError) as exc:
+            call()
+        assert exc.value.status == 404
+    assert api.job(job["job_id"])["estado"] == "COMPLETADO"
+
+
+def test_delete_request_id_reuse_for_another_version_is_409(api, iris):
+    from distriml.client.http import ApiError
+    _, _, a = _trained(api, iris, rid="del-a")
+    _, _, b = _trained(api, iris, rid="del-b")
+    (va,), (vb,) = api.versions(a["model_id"]), api.versions(b["model_id"])
+    api.delete_version(a["model_id"], va["version_id"], client_request_id="mismo-id")
+    with pytest.raises(ApiError) as exc:
+        api.delete_version(b["model_id"], vb["version_id"], client_request_id="mismo-id")
+    assert exc.value.status == 409
+    assert api.versions(b["model_id"])[0]["version_id"] == vb["version_id"]
+
+
 def test_submit_idempotent(api, iris):
     ds = api.upload_dataset("iris.csv", iris)
     mid = _model(api, "perceptron")
@@ -153,7 +213,7 @@ def test_cancel_running_job(api, iris):
     lambda api, ds, md: api.submit_job(ds, md, {"epochs": 0}),
     lambda api, ds, md: api.submit_job(ds, md, {"inventado": 1}),
     lambda api, ds, md: api.submit_job("dataset-ajeno", md, None),
-    lambda api, ds, md: api.upload_dataset("mal.csv", b"a,y\n1,x\n2,3\n"),
+    lambda api, ds, md: api.upload_dataset("mal.csv", b"a,y\nx,1\n2,3\n"),
 ])
 def test_validations_are_400(api, iris, make):
     ds = api.upload_dataset("iris.csv", iris)["dataset_id"]
