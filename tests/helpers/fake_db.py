@@ -41,6 +41,7 @@ class FakeDB:
         self.stats: dict[tuple, list] = {}                              # (model, version, minute) -> [count, latency_sum]
         self.workers: dict[str, int] = {}
         self._cancels: set[str] = set()
+        self._deletes: dict[str, tuple[str, dict]] = {}
 
     # ------------------------------------------------------------------ utilidades
     def _entry(self) -> str:
@@ -113,6 +114,9 @@ class FakeDB:
                 raise bad_request("hash_mismatch", "sha256/size no coinciden con el contenido")
             row = self.datasets.get(did)
             if row is None:
+                same = next((r for r in self.datasets.values() if r["client_id"] == client_id and r["sha256"] == sha256), None)
+                if same is not None:                       # mismo contenido: no se guarda otra copia
+                    return {**self._dataset_response(same, data), "already_existed": True}
                 meta = dataset.analyze(data, self.cfg.max_dataset_bytes)
                 self.store.put(sha256, data)
                 row = {"dataset_id": did, "client_id": client_id, "name": name, "sha256": sha256, "size": size,
@@ -120,9 +124,17 @@ class FakeDB:
                 self.datasets[did] = row
             elif row["sha256"] != sha256:
                 raise conflict("request_id_reused", "client_request_id ya se usó con otro contenido")
-            m = row["meta"]
-            return {"dataset_id": did, "n_rows": m.n_rows, "n_features": m.n_features,
-                    "classes": m.classes, "entry_id": row["entry_id"]}
+            return self._dataset_response(row, data)
+
+    @staticmethod
+    def _dataset_response(row: dict, data: bytes) -> dict:
+        m = row["meta"]
+        out = {"dataset_id": row["dataset_id"], "n_rows": m.n_rows, "n_features": m.n_features,
+               "classes": m.classes, "entry_id": row["entry_id"]}
+        names = dataset.class_names_of(data)
+        if names is not None:
+            out["class_names"] = names
+        return out
 
     def list_datasets(self, client_id, limit=100, cursor=None) -> list[dict]:
         with self._lock:
@@ -205,7 +217,7 @@ class FakeDB:
             rows = [{"batch_idx": k, "metrics": b["metrics"]} for k, b in sorted(self.batches[job_id].items())
                     if b["estado"] == C.BATCH_CONFIRMED]
             final = None
-            if job["estado"] == C.COMPLETADO:
+            if job["estado"] == C.COMPLETADO and job["model_id"] in self.models:
                 final = self.versions[job["model_id"]][0]["metrics"]
             return {"job_id": job_id, "estado": job["estado"], "batches": rows, "final": final}
 
@@ -215,10 +227,50 @@ class FakeDB:
                 "job_id": m["job_id"], "model_def_id": m["model_def_id"], "estado": v["estado"],
                 "canonical": v["canonical"], "sha256": v["sha256"], "metrics": v["metrics"]}
 
+    def list_models(self, client_id, limit=100, cursor=None) -> list[dict]:
+        with self._lock:
+            mine = [m for m in self.models.values() if m["client_id"] == client_id]
+            return [{"model_id": m["model_id"], "job_id": m["job_id"], "model_def_id": m["model_def_id"],
+                     "canonical_version_id": m["canonical_version_id"],
+                     "versions": len(self.versions.get(m["model_id"], [])),
+                     "created_at": m["created_at"], "metrics": m["training_metrics"]}
+                    for m in self._page(mine, "model_id", limit, cursor)]
+
     def list_model_versions(self, client_id, model_id) -> list[dict]:
         with self._lock:
             m = self._own(self.models, client_id, model_id)
             return [self._version_view(m, v) for v in self.versions[model_id]]
+
+    def delete_model_version(self, client_id, client_request_id, model_id, version_id) -> dict:
+        with self._lock:
+            key = ids.derive_delete_id(client_id, client_request_id)
+            target = f"{model_id}/{version_id}"
+            if key in self._deletes:
+                if self._deletes[key][0] != target:
+                    raise conflict("request_id_reused", "client_request_id ya se usó para borrar otra versión")
+                return dict(self._deletes[key][1])
+            m = self._own(self.models, client_id, model_id)
+            v = next((x for x in self.versions.get(model_id, []) if x["version_id"] == version_id), None)
+            if v is None:
+                raise not_found()
+            remaining = [x for x in self.versions[model_id] if x is not v]
+            promoted = None
+            if v["canonical"] and remaining:
+                promoted = max(remaining, key=lambda x: x["version"])
+                promoted["canonical"] = True
+                m["canonical_version_id"] = promoted["version_id"]
+            if remaining:
+                self.versions[model_id] = remaining
+            else:
+                del self.versions[model_id]
+                del self.models[model_id]
+            out = {"deleted": version_id, "model_deleted": not remaining,
+                   "canonical_version_id": (promoted or {}).get("version_id") if remaining else None,
+                   "entry_id": self._entry()}
+            if remaining and promoted is None:
+                out["canonical_version_id"] = m["canonical_version_id"]
+            self._deletes[key] = (target, out)
+            return dict(out)
 
     def get_model_version(self, client_id, model_id, version_id) -> dict:
         with self._lock:
@@ -257,7 +309,11 @@ class FakeDB:
             c = self.stats.setdefault(key, [0, 0.0])
             c[0] += 1
             c[1] += ms
-        return {"prediction": pred, "version_id": v["version_id"], "sha256": v["sha256"]}
+        result = {"prediction": pred, "version_id": v["version_id"], "sha256": v["sha256"]}
+        label = algorithms.label_of(state, pred)
+        if label is not None:
+            result["label"] = label
+        return result
 
     def get_model_stats(self, client_id, model_id, version_id=None, from_minute=None, to_minute=None) -> dict:
         with self._lock:
@@ -343,7 +399,8 @@ class FakeDB:
                 raise unavailable("artifact_unavailable", "el modelo final no está en el almacén")
             mid = ids.derive_model_id(job["job_id"])
             self.models[mid] = {"model_id": mid, "job_id": job["job_id"], "client_id": job["client_id"],
-                                "model_def_id": job["model_def_id"]}
+                                "model_def_id": job["model_def_id"], "canonical_version_id": attempt_id,
+                                "created_at": self._clock(), "training_metrics": metrics}
             self.versions[mid] = [{"version_id": attempt_id, "version": 1, "sha256": model_sha256,
                                    "metrics": metrics, "estado": C.VERSION_ENTRENADO, "canonical": True}]
             job.update(estado=C.COMPLETADO, model_id=mid, canonical_version_id=attempt_id, model_version=1,
