@@ -20,7 +20,7 @@ def test_constant_feature_std_replaced_by_one():
     assert dataset.analyze(b"a,b,y\n1,2,0\n1,3,1\n").feature_std[0] == 1.0
 
 
-@pytest.mark.parametrize("bad", [b"", b"a,y\n1,2\n", b"a,y\n1,x\n2,3\n", b"a,y\n1,2\n3\n", b"a,y\n1,nan\n2,3\n", b"\xff\xfe"])
+@pytest.mark.parametrize("bad", [b"", b"a,y\n1,2\n", b"a,y\nx,1\n2,3\n", b"a,y\n1,2\n3\n", b"a,y\n1,nan\n2,3\n", b"\xff\xfe"])
 def test_invalid_rejected_with_400(bad):
     with pytest.raises(ContractError) as e:
         dataset.analyze(bad)
