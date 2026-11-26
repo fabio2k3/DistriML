@@ -112,11 +112,19 @@ class ApiClient:
     def metrics(self, job_id: str) -> dict:
         return self.request("GET", f"/jobs/{job_id}/metrics")
 
+    def trained_models(self, limit: int = 100, cursor: str | None = None) -> list:
+        return self.request("GET", "/models", params={"limit": limit, "cursor": cursor})
+
     def versions(self, model_id: str) -> list:
         return self.request("GET", f"/models/{model_id}/versions")
 
     def version(self, model_id: str, version_id: str) -> dict:
         return self.request("GET", f"/models/{model_id}/versions/{version_id}")
+
+    def delete_version(self, model_id: str, version_id: str, client_request_id: str | None = None) -> dict:
+        """Borra una versión. Si era la única, el modelo desaparece. Los reintentos reutilizan el mismo id."""
+        return self.request("DELETE", f"/models/{model_id}/versions/{version_id}",
+                            params={"client_request_id": client_request_id or new_request_id()})
 
     def stats(self, model_id: str, version_id: str | None = None,
               from_minute: int | None = None, to_minute: int | None = None) -> dict:
