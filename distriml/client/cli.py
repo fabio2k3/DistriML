@@ -1,4 +1,4 @@
-"""Consola de usuario: `distriml <comando>` (o `python -m distriml.client <comando>`).
+"""Consola de usuario: `distriml <comando>` (o `python -m distriml.client <comando>`); sin comando abre el menú interactivo.
 
 El usuario no conoce la topología: solo la URL del gateway (--url o $DISTRIML_URL).
 La identidad (username local + client_id aleatorio) se crea una vez con `init`.
@@ -48,7 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="distriml", description="Consola de DistriML")
     p.add_argument("--url", default=os.environ.get("DISTRIML_URL", DEFAULT_URL), help="URL del gateway")
     p.add_argument("-v", "--verbose", action="store_true", help="muestra cada petición HTTP y sus reintentos")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")           # sin comando se abre la consola interactiva
+
+    sub.add_parser("app", help="consola interactiva con menú (es lo que se abre si no escribes ningún comando)")
 
     s = sub.add_parser("init", help="crea tu identidad local")
     s.add_argument("username")
@@ -57,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("whoami", help="muestra tu username (y el client_id con --show-id)")
     s.add_argument("--show-id", action="store_true")
 
-    sub.add_parser("models", help="lista el catálogo de modelos")
+    s = sub.add_parser("models", help="lista el catálogo de modelos (con --mine, tus modelos entrenados)")
+    s.add_argument("--mine", action="store_true", help="lista tus modelos ya entrenados (los que sirven para predict)")
 
     s = sub.add_parser("upload", help="sube un dataset CSV (última columna = etiqueta)")
     s.add_argument("path")
@@ -90,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("model_id")
     s.add_argument("--version-id")
 
+    s = sub.add_parser("delete-version", help="borra una versión de un modelo (si es la única, el modelo desaparece)")
+    s.add_argument("model_id")
+    s.add_argument("version_id")
+    s.add_argument("--request-id")
+
     s = sub.add_parser("stats", help="estadísticas de inferencia de un modelo")
     s.add_argument("model_id")
     s.add_argument("--version-id")
@@ -109,6 +117,9 @@ def _resolve_model(client: ApiClient, value: str) -> str:
 
 
 def run(args) -> int:
+    if args.cmd in (None, "app"):
+        from distriml.client.console import run_console
+        return run_console(args.url)
     if args.cmd == "init":
         data = identity.init_identity(args.username, force=args.force)
         print(f"identidad creada para '{data['username']}'")
@@ -121,7 +132,7 @@ def run(args) -> int:
     client = _client(args)
     try:
         if args.cmd == "models":
-            _print(client.models())
+            _print(client.trained_models() if args.mine else client.models())
         elif args.cmd == "upload":
             path = Path(args.path)
             _print(client.upload_dataset(args.name or path.name, path.read_bytes(), args.request_id))
@@ -149,6 +160,8 @@ def run(args) -> int:
             _print(client.metrics(args.job_id))
         elif args.cmd == "versions":
             _print(client.version(args.model_id, args.version_id) if args.version_id else client.versions(args.model_id))
+        elif args.cmd == "delete-version":
+            _print(client.delete_version(args.model_id, args.version_id, args.request_id))
         elif args.cmd == "stats":
             _print(client.stats(args.model_id, args.version_id))
         elif args.cmd == "predict":
