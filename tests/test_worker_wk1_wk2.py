@@ -198,7 +198,7 @@ def test_prepare_missing_dataset_is_unavailable(db):
 # ---------------------------------------------------------------- WK-1: bucle del worker
 def test_worker_registers_and_requests_job(db, workers, monkeypatch):
     got = []
-    monkeypatch.setattr(trainer, "run_attempt", lambda a, wid, db_, cfg: got.append((a, wid)) or "COMPLETED")
+    monkeypatch.setattr(trainer, "run_attempt", lambda a, wid, db_, cfg, abort=None: got.append((a, wid)) or "COMPLETED")
     job_id = seed_job(db)
     w = Worker("w0", db, fast_cfg())
     workers.append(w)
@@ -219,7 +219,7 @@ def test_worker_idle_polling_and_status(db, workers):
 def test_worker_current_attempt_visible_and_cleared(db, workers, monkeypatch):
     inside, release = threading.Event(), threading.Event()
 
-    def fake_run(a, wid, db_, cfg):
+    def fake_run(a, wid, db_, cfg, abort=None):
         inside.set()
         release.wait(5)
         return "COMPLETED"
@@ -255,7 +255,7 @@ def test_worker_survives_non_503_contract_error(db, workers):
 def test_worker_survives_unexpected_error_and_takes_next_job(db, workers, monkeypatch):
     calls = []
 
-    def fake_run(a, wid, db_, cfg):
+    def fake_run(a, wid, db_, cfg, abort=None):
         calls.append(a.job_id)
         if len(calls) == 1:
             raise RuntimeError("fallo inesperado")
