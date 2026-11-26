@@ -48,7 +48,10 @@ class DBService(Protocol):
     def create_dataset(self, client_id: str, client_request_id: str, name: str,
                        sha256: str, size: int, data: bytes) -> dict:
         """Valida y guarda un dataset CSV. Repetir la misma petición devuelve el mismo resultado.
-        Devuelve {"dataset_id", "n_rows", "n_features", "classes", "entry_id"}."""
+        Si el cliente ya tenía un dataset con ese MISMO contenido (mismo sha256) no se guarda otra copia: se
+        devuelve el existente, con "already_existed": true.
+        Devuelve {"dataset_id", "n_rows", "n_features", "classes", "entry_id"} y, si la etiqueta del CSV es
+        texto, también "class_names" (los nombres en el orden de sus números de clase)."""
 
     def list_datasets(self, client_id: str, limit: int = 100, cursor: str | None = None) -> list[dict]:
         """Datasets del cliente: [{"dataset_id", "name", "sha256", "size"}].
@@ -79,8 +82,20 @@ class DBService(Protocol):
         """Métricas por batch confirmado y finales:
         {"job_id", "estado", "batches": [{"batch_idx", "metrics"}], "final": dict | None}."""
 
+    def list_models(self, client_id: str, limit: int = 100, cursor: str | None = None) -> list[dict]:
+        """Modelos entrenados del cliente, en orden de creación:
+        [{"model_id", "job_id", "model_def_id", "canonical_version_id", "versions", "created_at", "metrics"}].
+        `cursor` es el model_id del último elemento de la página anterior."""
+
     def list_model_versions(self, client_id: str, model_id: str) -> list[dict]:
         """Versiones de un modelo del cliente (misma forma que get_model_version)."""
+
+    def delete_model_version(self, client_id: str, client_request_id: str, model_id: str, version_id: str) -> dict:
+        """Borra una versión de un modelo del cliente. Idempotente por `client_request_id`.
+        Si era la canónica y quedan otras, la más reciente pasa a serlo; si era la última, el modelo desaparece
+        (ya no se puede predecir con él). Los artefactos del almacén no se borran (los comparten los checkpoints).
+        Devuelve {"deleted": version_id, "model_deleted": bool, "canonical_version_id": str | None, "entry_id"}.
+        404 si el modelo o la versión no existen (o son ajenos)."""
 
     def get_model_version(self, client_id: str, model_id: str, version_id: str) -> dict:
         """{"model_id", "version_id", "version", "job_id", "model_def_id", "estado", "canonical",
@@ -94,7 +109,8 @@ class DBService(Protocol):
     def predict(self, client_id: str, model_id: str, input: dict,
                 version_id: str | None = None, version: int | None = None) -> dict:
         """Predicción con un modelo del cliente. `input` = {"features": [...]}.
-        Sin versión indicada usa la canónica. Devuelve {"prediction", "version_id", "sha256"}."""
+        Sin versión indicada usa la canónica. Devuelve {"prediction", "version_id", "sha256"} y, si el modelo
+        se entrenó con etiquetas de texto, también "label" (el nombre de la clase predicha)."""
 
     # ------------------------------------------------------------------ worker
     def register_worker(self, worker_id: str) -> WorkerConfig:
