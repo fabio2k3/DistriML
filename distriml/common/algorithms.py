@@ -1,7 +1,7 @@
 """Algoritmos del catálogo con scikit-learn y entrenamiento incremental.
 
 Estado de un modelo (checkpoint y modelo final): un diccionario
-    {"estimator", "feature_mean", "feature_std", "classes"}
+    {"estimator", "feature_mean", "feature_std", "classes", "class_names"}
 serializado con pickle (protocolo fijo). El estado interno de `partial_fit` viaja dentro del pickle,
 así que reanudar desde un checkpoint produce el mismo resultado que continuar sin interrupción
 (lo comprueba tests/test_algorithms.py).
@@ -45,13 +45,15 @@ def _build_estimator(algorithm: str, hp: dict):
     raise ValueError(f"algoritmo desconocido: {algorithm}")
 
 
-def init_state(algorithm: str, hyperparams: dict, meta: DatasetMeta) -> dict:
-    """Estado inicial (batch 0): estimador sin entrenar + metadatos de estandarización."""
+def init_state(algorithm: str, hyperparams: dict, meta: DatasetMeta, class_names: list[str] | None = None) -> dict:
+    """Estado inicial (batch 0): estimador sin entrenar + metadatos de estandarización.
+    `class_names` (si las etiquetas del dataset eran texto) permite responder con el nombre de la clase."""
     return {
         "estimator": _build_estimator(algorithm, hyperparams),
         "feature_mean": list(meta.feature_mean),
         "feature_std": list(meta.feature_std),
         "classes": None if meta.classes is None else list(meta.classes),
+        "class_names": None if class_names is None else list(class_names),
     }
 
 
@@ -98,6 +100,14 @@ def predict(state: dict, algorithm: str, features) -> int | float:
     xs = ((x - mean) / np.asarray(state["feature_std"])).reshape(1, -1)
     value = state["estimator"].predict(xs)[0]
     return int(value) if task_of(algorithm) == "classification" else float(value)
+
+
+def label_of(state: dict, prediction) -> str | None:
+    """Nombre de la clase predicha, o None si el modelo se entrenó con etiquetas numéricas."""
+    names, classes = state.get("class_names"), state.get("classes")
+    if not names or classes is None or prediction not in classes:
+        return None
+    return names[classes.index(prediction)]
 
 
 def serialize_state(state: dict) -> bytes:
