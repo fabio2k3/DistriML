@@ -68,7 +68,7 @@ def test_dataset_with_wrong_hash_or_size_is_400(db):
         db.create_dataset(CLIENT_A, "r", "n", sha256_hex(IRIS), len(IRIS) + 1, IRIS)
 
 
-@pytest.mark.parametrize("bad", [b"", b"a,y\n1,x\n2,3\n", b"a,y\n1,2\n", b"solo\n1\n2\n", b"\xff\xfe\x00"])
+@pytest.mark.parametrize("bad", [b"", b"a,y\nx,1\n2,3\n", b"a,y\n1,\n2,x\n", b"a,y\n1,2\n", b"solo\n1\n2\n", b"\xff\xfe\x00"])
 def test_invalid_csv_is_400_and_nothing_is_stored(db, bad):
     with expect(400):
         new_dataset(db, data=bad)
@@ -383,3 +383,244 @@ def test_entry_ids_are_unique_and_increasing(db):
     entries.append(db.cancel_job(CLIENT_A, "c", new_job(db, ds["dataset_id"], rid="j2")["job_id"])["entry_id"])
     numbers = [int(e.split(":")[1]) for e in entries]
     assert len(set(numbers)) == 3 and numbers == sorted(numbers)
+
+
+# ---------------------------------------------------------------------------- listado de modelos entrenados
+def finished_model(db, client=CLIENT_A, rid="m1"):
+    """Entrena un job hasta el final con el worker `w1` y devuelve (job, model_id)."""
+    _, job, a = start_job(db, client, rid=rid)
+    train(db, "w1", a)
+    return job, db.get_job(client, job["job_id"])["model_id"]
+
+
+def test_list_models_is_empty_until_a_job_completes(db):
+    assert db.list_models(CLIENT_A) == []
+    _, job, a = start_job(db)
+    train(db, "w1", a, upto=3, finish=False)
+    assert db.list_models(CLIENT_A) == []                    # un job en curso aún no tiene modelo
+
+
+def test_list_models_describes_the_trained_model(db):
+    job, model_id = finished_model(db)
+    (m,) = db.list_models(CLIENT_A)
+    assert set(m) == {"model_id", "job_id", "model_def_id", "canonical_version_id", "versions", "created_at", "metrics"}
+    assert (m["model_id"], m["job_id"], m["versions"]) == (model_id, job["job_id"], 1)
+    assert m["model_def_id"] == model_def_id("sgd_logistic")
+    ver = db.list_model_versions(CLIENT_A, model_id)[0]
+    assert m["canonical_version_id"] == ver["version_id"] and m["metrics"] == ver["metrics"]
+    assert db.predict(CLIENT_A, model_id, {"features": [5.1, 3.5, 1.4, 0.2]})["version_id"] == m["canonical_version_id"]
+
+
+def test_list_models_pages_in_creation_order(db):
+    made = []
+    for i in range(3):
+        _, model_id = finished_model(db, rid=f"m{i}")
+        made.append(model_id)
+    assert [m["model_id"] for m in db.list_models(CLIENT_A)] == made
+    first = db.list_models(CLIENT_A, limit=2)
+    rest = db.list_models(CLIENT_A, limit=2, cursor=first[-1]["model_id"])
+    assert [m["model_id"] for m in first + rest] == made and len(rest) == 1
+    assert db.list_models(CLIENT_A, cursor="desconocido") == []
+
+
+@pytest.mark.parametrize("limit", [0, -1, "5", None, True])
+def test_list_models_invalid_limit_is_400(db, limit):
+    with expect(400, "invalid_limit"):
+        db.list_models(CLIENT_A, limit=limit)
+
+
+def test_models_are_isolated_between_clients(db):
+    _, model_a = finished_model(db, CLIENT_A, rid="a")
+    assert db.list_models(CLIENT_B) == []
+    _, model_b = finished_model(db, CLIENT_B, rid="b")
+    assert [m["model_id"] for m in db.list_models(CLIENT_A)] == [model_a]
+    assert [m["model_id"] for m in db.list_models(CLIENT_B)] == [model_b]
+
+
+# ---------------------------------------------------------------------------- etiquetas de texto
+def test_predict_answers_with_the_class_name_when_labels_were_text(db):
+    from tests.conftest import SAMPLES
+    data = (SAMPLES / "iris_names.csv").read_bytes()
+    ds = new_dataset(db, data=data, name="iris_names.csv")
+    assert ds["class_names"] == ["setosa", "versicolor", "virginica"] and ds["classes"] == [0, 1, 2]
+    new_job(db, ds["dataset_id"])
+    a = db.request_job("w1")
+    train(db, "w1", a)
+    model_id = db.get_job(CLIENT_A, a.job_id)["model_id"]
+    res = db.predict(CLIENT_A, model_id, {"features": [5.0, 3.4, 1.5, 0.2]})
+    assert res["label"] == ["setosa", "versicolor", "virginica"][res["prediction"]]
+    assert set(res) == {"prediction", "version_id", "sha256", "label"}
+
+
+def test_numeric_labels_keep_the_old_response_shape(db):
+    _, job, a = start_job(db)
+    train(db, "w1", a)
+    model_id = db.get_job(CLIENT_A, job["job_id"])["model_id"]
+    assert set(db.predict(CLIENT_A, model_id, {"features": [5.1, 3.5, 1.4, 0.2]})) == {"prediction", "version_id", "sha256"}
+    assert "class_names" not in new_dataset(db, rid="otro", data=IRIS + b"1,1,1,1,0\n")
+
+
+def test_dataset_response_with_names_is_idempotent(db):
+    from tests.conftest import SAMPLES
+    data = (SAMPLES / "iris_names.csv").read_bytes()
+    first = new_dataset(db, data=data, name="n.csv")
+    again = new_dataset(db, data=data, name="n.csv")
+    assert first == again and again["class_names"][0] == "setosa"
+
+
+# ---------------------------------------------------------------------------- datasets repetidos
+def test_same_content_with_another_request_id_does_not_create_a_second_dataset(db):
+    first = new_dataset(db, rid="a")
+    again = new_dataset(db, rid="b")
+    assert again["dataset_id"] == first["dataset_id"] and again["already_existed"] is True
+    assert "already_existed" not in first
+    assert len(db.list_datasets(CLIENT_A)) == 1
+    third = new_dataset(db, rid="c", name="otro-nombre.csv")             # el nombre no cuenta: el contenido es el mismo
+    assert third["dataset_id"] == first["dataset_id"] and len(db.list_datasets(CLIENT_A)) == 1
+    assert db.list_datasets(CLIENT_A)[0]["name"] == "iris.csv"
+
+
+def test_a_duplicate_upload_does_not_write_a_second_copy_or_consume_state(db):
+    new_dataset(db, rid="a")
+    before = (len(db.store.list_hashes()), db.tables.datasets.load())
+    new_dataset(db, rid="b")
+    assert (len(db.store.list_hashes()), db.tables.datasets.load()) == before
+
+
+def test_duplicate_upload_is_idempotent_by_request_id(db):
+    new_dataset(db, rid="a")
+    assert new_dataset(db, rid="b") == new_dataset(db, rid="b")
+
+
+def test_different_content_is_a_different_dataset(db):
+    a = new_dataset(db, rid="a")
+    b = new_dataset(db, rid="b", data=IRIS + b"1,1,1,1,0\n")
+    assert a["dataset_id"] != b["dataset_id"] and len(db.list_datasets(CLIENT_A)) == 2
+
+
+def test_the_same_content_from_two_clients_is_stored_for_each(db):
+    a = new_dataset(db, CLIENT_A, rid="a")
+    b = new_dataset(db, CLIENT_B, rid="a")
+    assert a["dataset_id"] != b["dataset_id"] and "already_existed" not in b
+    assert len(db.list_datasets(CLIENT_A)) == len(db.list_datasets(CLIENT_B)) == 1
+
+
+def test_request_id_reused_with_other_content_is_still_409(db):
+    new_dataset(db, rid="a")
+    with expect(409, "request_id_reused"):
+        new_dataset(db, rid="a", data=IRIS + b"1,1,1,1,0\n")
+
+
+def test_jobs_can_use_the_dataset_returned_for_a_duplicate(db):
+    new_dataset(db, rid="a")
+    dup = new_dataset(db, rid="b")
+    job = new_job(db, dup["dataset_id"])
+    assert db.get_job(CLIENT_A, job["job_id"])["dataset_id"] == dup["dataset_id"]
+
+
+# ---------------------------------------------------------------------------- borrar versiones de modelos
+def trained_model(db, client=CLIENT_A, rid="m1"):
+    _, job, a = start_job(db, client, rid=rid)
+    train(db, "w1", a)
+    model_id = db.get_job(client, job["job_id"])["model_id"]
+    return job, model_id, db.list_model_versions(client, model_id)[0]
+
+
+def test_deleting_the_only_version_removes_the_model(db):
+    job, model_id, ver = trained_model(db)
+    res = db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    assert res["deleted"] == ver["version_id"] and res["model_deleted"] is True and res["canonical_version_id"] is None
+    assert db.list_models(CLIENT_A) == []
+    for call in (lambda: db.list_model_versions(CLIENT_A, model_id), lambda: db.get_model_version(CLIENT_A, model_id, ver["version_id"]),
+                 lambda: db.predict(CLIENT_A, model_id, {"features": [5.1, 3.5, 1.4, 0.2]}),
+                 lambda: db.get_model_stats(CLIENT_A, model_id)):
+        with expect(404):
+            call()
+
+
+def test_the_job_stays_completed_after_its_model_is_deleted(db):
+    job, model_id, ver = trained_model(db)
+    db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    v = db.get_job(CLIENT_A, job["job_id"])
+    assert v["estado"] == C.COMPLETADO
+    m = db.get_job_metrics(CLIENT_A, job["job_id"])
+    assert m["estado"] == C.COMPLETADO and len(m["batches"]) == 6 and m["final"] is None
+
+
+def test_delete_is_idempotent_by_request_id_even_after_the_model_is_gone(db):
+    _, model_id, ver = trained_model(db)
+    first = db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    assert db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"]) == first
+
+
+def test_a_new_request_id_for_an_already_deleted_version_is_404(db):
+    _, model_id, ver = trained_model(db)
+    db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    with expect(404):
+        db.delete_model_version(CLIENT_A, "d2", model_id, ver["version_id"])
+
+
+def test_delete_request_id_cannot_be_reused_for_another_version(db):
+    _, model_a, ver_a = trained_model(db, rid="a")
+    _, model_b, ver_b = trained_model(db, rid="b")
+    db.delete_model_version(CLIENT_A, "d1", model_a, ver_a["version_id"])
+    with expect(409, "request_id_reused"):
+        db.delete_model_version(CLIENT_A, "d1", model_b, ver_b["version_id"])
+    assert [m["model_id"] for m in db.list_models(CLIENT_A)] == [model_b]
+
+
+def test_delete_only_touches_the_chosen_model(db):
+    _, model_a, ver_a = trained_model(db, rid="a")
+    _, model_b, _ = trained_model(db, rid="b")
+    db.delete_model_version(CLIENT_A, "d1", model_a, ver_a["version_id"])
+    assert [m["model_id"] for m in db.list_models(CLIENT_A)] == [model_b]
+    assert db.predict(CLIENT_A, model_b, {"features": [5.1, 3.5, 1.4, 0.2]})["prediction"] in (0, 1, 2)
+
+
+def test_delete_is_isolated_between_clients_and_validates_ids(db):
+    _, model_id, ver = trained_model(db)
+    for call in (lambda: db.delete_model_version(CLIENT_B, "d1", model_id, ver["version_id"]),
+                 lambda: db.delete_model_version(CLIENT_A, "d2", "no-existe", ver["version_id"]),
+                 lambda: db.delete_model_version(CLIENT_A, "d3", model_id, "no-existe")):
+        with expect(404):
+            call()
+    assert len(db.list_models(CLIENT_A)) == 1                                  # nada se borró
+
+
+def test_the_deleted_model_can_be_trained_again(db):
+    job, model_id, ver = trained_model(db)
+    db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    ds = db.list_datasets(CLIENT_A)[0]
+    new_job(db, ds["dataset_id"], rid="otra-vez")
+    train(db, "w1", db.request_job("w1"))
+    (m,) = db.list_models(CLIENT_A)
+    assert m["model_id"] != model_id and m["versions"] == 1
+
+
+def _with_second_version(db, model_id):
+    """El sistema solo crea una versión por modelo; para probar el caso de varias se añade una a mano."""
+    from distriml.db.records import encode
+    v1 = db._versions[model_id][0]
+    v2 = {**v1, "version_id": "version-2", "version": 2, "canonical": False, "entry_id": db._next_entry_id()}
+    db.tables.model_versions.append(encode("model_versions", v2))
+    db._versions[model_id].append(v2)
+    return v2
+
+
+def test_deleting_the_canonical_version_promotes_the_latest_remaining_one(db):
+    _, model_id, ver = trained_model(db)
+    _with_second_version(db, model_id)
+    res = db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    assert res["model_deleted"] is False and res["canonical_version_id"] == "version-2"
+    (left,) = db.list_model_versions(CLIENT_A, model_id)
+    assert left["version_id"] == "version-2" and left["canonical"] is True
+    assert db.list_models(CLIENT_A)[0]["canonical_version_id"] == "version-2" and db.list_models(CLIENT_A)[0]["versions"] == 1
+    assert db.predict(CLIENT_A, model_id, {"features": [5.1, 3.5, 1.4, 0.2]})["version_id"] == "version-2"
+
+
+def test_deleting_a_non_canonical_version_keeps_the_canonical_one(db):
+    _, model_id, ver = trained_model(db)
+    _with_second_version(db, model_id)
+    res = db.delete_model_version(CLIENT_A, "d1", model_id, "version-2")
+    assert res["model_deleted"] is False and res["canonical_version_id"] == ver["version_id"]
+    assert [v["version_id"] for v in db.list_model_versions(CLIENT_A, model_id)] == [ver["version_id"]]
