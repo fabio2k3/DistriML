@@ -59,9 +59,13 @@ class InferenceEngine:
             self._cache.move_to_end(sha256)
         return state
 
+    def forget(self, sha256: str) -> None:
+        """Saca de la caché el modelo de una versión borrada."""
+        self._cache.pop(sha256, None)
+
     # ------------------------------------------------------------------ API
     def predict(self, version_row: dict, algorithm: str, features) -> dict:
-        """Devuelve {"prediction", "version_id", "sha256"} y suma 1 al contador
+        """Devuelve {"prediction", "version_id", "sha256"} (más "label" si las etiquetas eran texto) y suma 1 al contador
         (model_id, version_id, minuto) con la latencia medida en ms."""
         t0 = time.perf_counter()
         state = self._state(version_row["sha256"])
@@ -74,7 +78,11 @@ class InferenceEngine:
         c = self._counters.setdefault((version_row["model_id"], version_row["version_id"], minute), [0, 0.0])
         c[0] += 1
         c[1] += ms
-        return {"prediction": prediction, "version_id": version_row["version_id"], "sha256": version_row["sha256"]}
+        result = {"prediction": prediction, "version_id": version_row["version_id"], "sha256": version_row["sha256"]}
+        label = algorithms.label_of(state, prediction)
+        if label is not None:                      # solo si el dataset tenía etiquetas de texto
+            result["label"] = label
+        return result
 
     def stats(self, model_id: str, version_id: str, from_minute: int | None, to_minute: int | None) -> dict:
         """{"model_id","version_id","total_calls","mean_latency_ms",
