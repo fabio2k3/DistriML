@@ -63,9 +63,10 @@ def train(db: Database, worker: str, a, upto: int | None = None, finish: bool = 
     """Entrena de verdad desde `a.next_batch` hasta `upto` (por defecto, todos), sube cada checkpoint y, si
     `finish` y se llegó al final, completa el job. Devuelve el sha256 del último estado subido."""
     meta = DatasetMeta.from_dict(a.dataset_meta)
-    X, y = dataset.load_for_training(db.get_artifact(a.dataset_sha256), meta, algorithms.task_of(a.algorithm))
+    data = db.get_artifact(a.dataset_sha256)
+    X, y = dataset.load_for_training(data, meta, algorithms.task_of(a.algorithm))
     state = (algorithms.deserialize_state(db.get_artifact(a.checkpoint_sha256)) if a.next_batch > 1
-             else algorithms.init_state(a.algorithm, a.hyperparams, meta))
+             else algorithms.init_state(a.algorithm, a.hyperparams, meta, dataset.class_names_of(data)))
     last = a.total_batches if upto is None else upto
     sha = None
     for k in range(a.next_batch, last + 1):
