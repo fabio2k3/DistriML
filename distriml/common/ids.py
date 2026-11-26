@@ -14,6 +14,7 @@ import uuid
 NS_JOB = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.job")
 NS_DATASET = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.dataset")
 NS_CANCEL = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.cancel")
+NS_DELETE = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.delete")
 NS_MODEL = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.model")
 NS_MODELDEF = uuid.uuid5(uuid.NAMESPACE_DNS, "distriml.modeldef")
 
@@ -59,6 +60,11 @@ def derive_dataset_id(client_id: str, client_request_id: str) -> str:
 def derive_cancel_id(client_id: str, client_request_id: str) -> str:
     """Clave de idempotencia de una cancelación."""
     return _derive(NS_CANCEL, client_id, client_request_id)
+
+
+def derive_delete_id(client_id: str, client_request_id: str) -> str:
+    """Clave de idempotencia del borrado de una versión de modelo."""
+    return _derive(NS_DELETE, client_id, client_request_id)
 
 
 def derive_model_id(job_id: str) -> str:
