@@ -4,8 +4,11 @@ Convenciones:
   - Columnas con estructura (hyperparams, metrics, classes, feature_mean, feature_std) se guardan
     como JSON en una celda (csvtable.dumps / csvtable.loads).
   - Tiempos en milisegundos desde epoch (informativos, no deciden nada salvo el lease).
-  - Tablas de estado cambiante (jobs, attempts, models, model_versions, datasets): `rewrite`.
-  - Tablas de solo anexado (job_batches, inference_stats se reescribe cada cierto tiempo): `append`.
+  - Tablas de estado cambiante (jobs, attempts): `rewrite` (reescritura atómica completa).
+  - Tablas de solo anexado (datasets, job_batches, models, model_versions, requests, inference_stats): `append`.
+    `inference_stats` recibe una fila por predicción y se compacta (una fila por modelo, versión y minuto)
+    al arrancar la DB.
+  - Las filas se convierten de/hacia sus tipos en memoria con db/records.py.
 """
 from __future__ import annotations
 
