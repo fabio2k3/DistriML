@@ -166,6 +166,11 @@ def create_app(db: DBService) -> FastAPI:
     def job_metrics(job_id: str, cid: str = Depends(client_id_dep)):
         return db.get_job_metrics(cid, job_id)
 
+    @app.get("/models")
+    def get_models(limit: int = Query(100, ge=1, le=500), cursor: str | None = None,
+                   cid: str = Depends(client_id_dep)):
+        return db.list_models(cid, limit, cursor)
+
     @app.get("/models/{model_id}/versions")
     def model_versions(model_id: str, cid: str = Depends(client_id_dep)):
         return db.list_model_versions(cid, model_id)
@@ -173,6 +178,11 @@ def create_app(db: DBService) -> FastAPI:
     @app.get("/models/{model_id}/versions/{version_id}")
     def model_version(model_id: str, version_id: str, cid: str = Depends(client_id_dep)):
         return db.get_model_version(cid, model_id, version_id)
+
+    @app.delete("/models/{model_id}/versions/{version_id}")
+    def delete_model_version(model_id: str, version_id: str, client_request_id: str = Query(..., min_length=1, max_length=128),
+                             cid: str = Depends(client_id_dep)):
+        return db.delete_model_version(cid, client_request_id, model_id, version_id)
 
     @app.get("/models/{model_id}/stats")
     def model_stats(model_id: str, version_id: str | None = None, from_: int | None = Query(None, alias="from"),
