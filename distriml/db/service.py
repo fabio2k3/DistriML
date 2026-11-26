@@ -165,6 +165,12 @@ class Database:
                 job.update(estado=C.PENDIENTE, attempt_vigente=None)
                 self.log.warning("recuperado: job %s estaba EN_EJECUCION sin attempt activo -> PENDIENTE", short(job["job_id"]))
                 changed = True
+        sin_versiones = [mid for mid in self._models if not self._versions.get(mid)]
+        for mid in sin_versiones:                      # corte entre guardar el modelo y su versión, o al borrar la última
+            del self._models[mid]
+            self.log.warning("recuperado: el modelo %s no tenía versiones -> descartado", short(mid))
+        if sin_versiones:
+            self.tables.models.rewrite(encode("models", r) for r in self._models.values())
         if changed:
             self._save_jobs()
             self._save_attempts()
@@ -289,6 +295,12 @@ class Database:
             if row is not None and row["sha256"] != sha256:
                 raise conflict("request_id_reused", "client_request_id ya se usó con otro contenido")
             if row is None:
+                same = next((r for r in self._datasets.values()
+                             if r["client_id"] == client_id and r["sha256"] == sha256), None)
+                if same is not None:                       # el mismo contenido ya está guardado para este cliente
+                    self.log.info("dataset %s ya existía (mismo contenido): no se guarda otra copia", short(same["dataset_id"]))
+                    original = self._response_for(same["dataset_id"], "dataset", sha256, lambda entry: self._dataset_response(same, entry, data))
+                    return {**original, "already_existed": True}
                 meta = dataset.analyze(data, self.cfg.max_dataset_bytes)       # 400 si el CSV es inválido
                 self.store.put(sha256, data)
                 row = {"dataset_id": did, "client_id": client_id, "name": name, "sha256": sha256, "size": size,
@@ -297,9 +309,16 @@ class Database:
                 self._datasets[did] = row
                 self.log.info("dataset %s guardado: %d filas, %d características, clases=%s",
                               short(did), row["n_rows"], row["n_features"], row["classes"])
-            return self._response_for(did, "dataset", sha256, lambda entry: {
-                "dataset_id": did, "n_rows": row["n_rows"], "n_features": row["n_features"],
-                "classes": row["classes"], "entry_id": entry})
+            return self._response_for(did, "dataset", sha256, lambda entry: self._dataset_response(row, entry, data))
+
+    @staticmethod
+    def _dataset_response(row: dict, entry: str, data: bytes) -> dict:
+        out = {"dataset_id": row["dataset_id"], "n_rows": row["n_rows"], "n_features": row["n_features"],
+               "classes": row["classes"], "entry_id": entry}
+        names = dataset.class_names_of(data)
+        if names is not None:                            # etiquetas de texto: los nombres, en orden de clase
+            out["class_names"] = names
+        return out
 
     def list_datasets(self, client_id, limit=100, cursor=None) -> list[dict]:
         with self._lock:
@@ -394,7 +413,7 @@ class Database:
             rows = [{"batch_idx": k, "metrics": b["metrics"]}
                     for k, b in sorted(self._batches.get(job["job_id"], {}).items()) if b["estado"] == C.BATCH_CONFIRMED]
             final = None
-            if job["estado"] == C.COMPLETADO:
+            if job["estado"] == C.COMPLETADO and job["model_id"] in self._models:     # None si el modelo se borró
                 final = self._pick_version(job["model_id"], job["canonical_version_id"], None)["metrics"]
             return {"job_id": job["job_id"], "estado": job["estado"], "batches": rows, "final": final}
 
@@ -405,10 +424,57 @@ class Database:
                 "job_id": model["job_id"], "model_def_id": model["model_def_id"], "estado": v["estado"],
                 "canonical": v["canonical"], "sha256": v["sha256"], "metrics": v["metrics"]}
 
+    def list_models(self, client_id, limit=100, cursor=None) -> list[dict]:
+        with self._lock:
+            mine = [m for m in self._models.values() if m["client_id"] == client_id]
+            return [{"model_id": m["model_id"], "job_id": m["job_id"], "model_def_id": m["model_def_id"],
+                     "canonical_version_id": m["canonical_version_id"],
+                     "versions": len(self._versions.get(m["model_id"], [])),
+                     "created_at": m["created_at"], "metrics": m["training_metrics"]}
+                    for m in self._page(mine, "model_id", limit, cursor)]
+
     def list_model_versions(self, client_id, model_id) -> list[dict]:
         with self._lock:
             m = self._own(self._models, client_id, model_id)
             return [self._version_view(m, v) for v in self._versions.get(m["model_id"], [])]
+
+    def delete_model_version(self, client_id, client_request_id, model_id, version_id) -> dict:
+        with self._lock:
+            key = ids.derive_delete_id(client_id, client_request_id)
+            target = f"{model_id}/{version_id}"
+            prior = self._requests.get(key)
+            if prior is not None:
+                if prior["payload_hash"] != target:
+                    raise conflict("request_id_reused", "client_request_id ya se usó para borrar otra versión")
+                return dict(prior["response"])
+            m = self._own(self._models, client_id, model_id)
+            versions = self._versions.get(m["model_id"], [])
+            v = next((x for x in versions if x["version_id"] == version_id), None)
+            if v is None:
+                raise not_found()
+            remaining = [x for x in versions if x is not v]
+            promoted = None
+            if v["canonical"] and remaining:                       # otra versión pasa a ser la canónica: la más reciente
+                promoted = max(remaining, key=lambda x: x["version"])
+                promoted["canonical"] = True
+                m["canonical_version_id"] = promoted["version_id"]
+            if remaining:
+                self._versions[m["model_id"]] = remaining
+            else:
+                self._versions.pop(m["model_id"], None)
+            # Primero se quita lo que referencia (versiones) y luego el modelo: ver `_reconcile`.
+            self.tables.model_versions.rewrite(encode("model_versions", r) for vs in self._versions.values() for r in vs)
+            if not remaining:
+                del self._models[m["model_id"]]
+            if not remaining or promoted is not None:
+                self.tables.models.rewrite(encode("models", r) for r in self._models.values())
+            self.inference.forget(v["sha256"])
+            self.log.info("versión %s borrada del modelo %s%s", short(version_id), short(model_id),
+                          " (era la única: el modelo desaparece)" if not remaining else "")
+            return self._response_for(key, "delete", target, lambda entry: {
+                "deleted": version_id, "model_deleted": not remaining,
+                "canonical_version_id": promoted["version_id"] if promoted else (None if not remaining else m["canonical_version_id"]),
+                "entry_id": entry})
 
     def get_model_version(self, client_id, model_id, version_id) -> dict:
         with self._lock:
