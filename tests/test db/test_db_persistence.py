@@ -8,6 +8,7 @@ import pytest
 
 from distriml.common import constants as C
 from distriml.common.errors import ContractError
+from distriml.common.ids import sha256_hex
 from tests.helpers.db_utils import CLIENT_A, CLIENT_B, IRIS, FakeClock, make_db, new_dataset, new_job, start_job, train
 
 EXPIRY = 11_000                     # lease 10 s + margen 1 s
@@ -290,3 +291,84 @@ def test_model_binary_is_not_trusted_if_corrupted(tmp_path):
         again.predict(CLIENT_A, v["model_id"], {"features": [1, 2, 3, 4]})
     assert (e.value.status, e.value.reason) == (503, "artifact_unavailable")
     assert again.get_model_stats(CLIENT_A, v["model_id"])["total_calls"] == 0
+
+
+def test_trained_models_survive_a_restart(tmp_path):
+    db = make_db(tmp_path)
+    models = []
+    for i in range(2):
+        _, job, a = start_job(db, rid=f"m{i}")
+        train(db, "w1", a)
+        models.append(view(db, job)["model_id"])
+    before = db.list_models(CLIENT_A)
+    assert [m["model_id"] for m in before] == models
+    again = reopen(db)
+    assert again.list_models(CLIENT_A) == before
+    assert again.list_models(CLIENT_B) == []
+    assert again.predict(CLIENT_A, models[1], {"features": [5.1, 3.5, 1.4, 0.2]})["version_id"] == before[1]["canonical_version_id"]
+
+
+# ---------------------------------------------------------------------------- borrados y datasets repetidos
+def test_deleted_model_stays_deleted_after_a_restart(tmp_path):
+    db = make_db(tmp_path)
+    _, job, a = start_job(db, rid="m")
+    train(db, "w1", a)
+    model_id = view(db, job)["model_id"]
+    ver = db.list_model_versions(CLIENT_A, model_id)[0]
+    deleted = db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    again = reopen(db)
+    assert again.list_models(CLIENT_A) == []
+    with pytest.raises(ContractError) as exc:
+        again.predict(CLIENT_A, model_id, {"features": [5.1, 3.5, 1.4, 0.2]})
+    assert exc.value.status == 404
+    assert again.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"]) == deleted      # el reintento sigue siendo idempotente
+    assert view(again, job)["estado"] == C.COMPLETADO and csv_path(db, "model_versions").read_text().count("\n") == 1
+
+
+def test_entry_ids_keep_growing_after_deleting_the_newest_model(tmp_path):
+    db = make_db(tmp_path)
+    _, job, a = start_job(db, rid="m")
+    train(db, "w1", a)
+    model_id = view(db, job)["model_id"]
+    ver = db.list_model_versions(CLIENT_A, model_id)[0]
+    deleted = db.delete_model_version(CLIENT_A, "d1", model_id, ver["version_id"])
+    nxt = reopen(db).create_dataset(CLIENT_A, "otro", "n.csv", sha256_hex(b"a,y\n1,0\n2,1\n"), 12, b"a,y\n1,0\n2,1\n")
+    assert int(nxt["entry_id"].split(":")[1]) > int(deleted["entry_id"].split(":")[1])
+
+
+def test_a_model_left_without_versions_by_a_cut_is_discarded_on_startup(tmp_path):
+    db = make_db(tmp_path)
+    _, job, a = start_job(db, rid="m")
+    train(db, "w1", a)
+    assert len(db.list_models(CLIENT_A)) == 1
+    db.tables.model_versions.rewrite([])                         # corte entre quitar la versión y quitar el modelo
+    again = reopen(db)
+    assert again.list_models(CLIENT_A) == []
+    assert csv_path(db, "models").read_text().count("\n") == 1   # solo la cabecera: el reinicio dejó el fichero limpio
+
+
+def test_duplicate_dataset_detection_survives_a_restart(tmp_path):
+    db = make_db(tmp_path)
+    first = new_dataset(db, rid="a")
+    again = reopen(db)
+    dup = new_dataset(again, rid="b")
+    assert dup["dataset_id"] == first["dataset_id"] and dup["already_existed"] is True
+    assert len(again.list_datasets(CLIENT_A)) == 1
+
+
+def test_promotion_of_another_version_survives_a_restart(tmp_path):
+    from distriml.db.records import encode
+    db = make_db(tmp_path)
+    _, job, a = start_job(db, rid="m")
+    train(db, "w1", a)
+    model_id = view(db, job)["model_id"]
+    v1 = db._versions[model_id][0]
+    v2 = {**v1, "version_id": "version-2", "version": 2, "canonical": False, "entry_id": db._next_entry_id()}
+    db.tables.model_versions.append(encode("model_versions", v2))
+    db._versions[model_id].append(v2)
+    db.delete_model_version(CLIENT_A, "d1", model_id, v1["version_id"])
+    again = reopen(db)
+    (listed,) = again.list_models(CLIENT_A)
+    assert listed["canonical_version_id"] == "version-2" and listed["versions"] == 1
+    (ver,) = again.list_model_versions(CLIENT_A, model_id)
+    assert ver["version_id"] == "version-2" and ver["canonical"] is True
