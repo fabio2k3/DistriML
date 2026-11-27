@@ -39,6 +39,7 @@ def _float(lo: float, hi: float, exclusive_min: bool = False) -> dict:
 _BATCH = _int(1, 100_000)
 _EPOCHS = _int(1, 1_000)
 _SEED = _int(0, MAX_SEED)
+_K = _int(1, 1_000)
 _INPUT = {"type": "tabular_csv", "label": "last_column", "min_features": 1}
 _OUTPUT = {"type": "pickle", "protocol": 4, "keys": ["estimator", "feature_mean", "feature_std", "classes"]}
 
@@ -69,6 +70,22 @@ _DEFINITIONS = [
          {"batch_size": 32, "seed": 42, "var_smoothing": 1e-9},
          {"batch_size": _BATCH, "seed": _SEED, "var_smoothing": _float(0.0, 1.0)},
          fixed={"epochs": 1}),   # repetir épocas duplicaría las estadísticas
+    _def("k-Nearest Neighbors (clasificación) v1", "knn_classifier", "classification",
+         {"batch_size": 32, "seed": 42, "k": 5},
+         {"batch_size": _BATCH, "seed": _SEED, "k": _K},
+         fixed={"epochs": 1}),
+    _def("k-Nearest Neighbors (regresión) v1", "knn_regressor", "regression",
+         {"batch_size": 32, "seed": 42, "k": 5},
+         {"batch_size": _BATCH, "seed": _SEED, "k": _K},
+         fixed={"epochs": 1}),
+    _def("Nearest Centroid v1", "nearest_centroid", "classification",
+         {"batch_size": 32, "seed": 42},
+         {"batch_size": _BATCH, "seed": _SEED},
+         fixed={"epochs": 1}),
+    _def("Linear Regression (least squares) v1", "least_squares", "regression",
+         {"batch_size": 32, "seed": 42, "alpha": 0.0},
+         {"batch_size": _BATCH, "seed": _SEED, "alpha": _float(0.0, 1e6)},
+         fixed={"epochs": 1}),
 ]
 
 CATALOG: dict[str, ModelDef] = {d.model_def_id: d for d in _DEFINITIONS}

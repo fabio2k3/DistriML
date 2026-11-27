@@ -4,7 +4,7 @@ import pytest
 from tests.conftest import SAMPLES
 from distriml.common import algorithms, batching, catalog, dataset
 
-ALGOS = ["sgd_logistic", "perceptron", "gaussian_nb"]
+ALGOS = ["sgd_logistic", "perceptron", "gaussian_nb", "knn_classifier", "knn_regressor", "nearest_centroid", "least_squares"]
 
 
 def _train(algo, data, meta, hp, k_from, k_to, state=None):
@@ -21,7 +21,8 @@ def _train(algo, data, meta, hp, k_from, k_to, state=None):
 def test_resume_from_checkpoint_equals_continuous(algo):
     data = (SAMPLES / "iris.csv").read_bytes()
     meta = dataset.analyze(data)
-    user = {"batch_size": 20} if algo == "gaussian_nb" else {"epochs": 3, "batch_size": 20}
+    fixed_epochs = "epochs" in catalog.BY_ALGORITHM[algo].fixed_hyperparams     # no admiten repetir épocas
+    user = {"batch_size": 20} if fixed_epochs else {"epochs": 3, "batch_size": 20}
     hp = catalog.merge_hyperparams(catalog.BY_ALGORITHM[algo], user)
     total = catalog.compute_total_batches(hp, meta.n_rows)
     full, X, y = _train(algo, data, meta, hp, 1, total)
@@ -30,7 +31,7 @@ def test_resume_from_checkpoint_equals_continuous(algo):
     resumed, _, _ = _train(algo, data, meta, hp, total // 2 + 1, total, state=resumed)
     f, r = algorithms.evaluate_full(full, algo, X, y), algorithms.evaluate_full(resumed, algo, X, y)
     assert f == r
-    for attr in ("coef_", "intercept_", "theta_", "var_", "class_count_"):
+    for attr in ("coef_", "intercept_", "theta_", "var_", "class_count_", "X_", "y_", "sum_", "count_", "A_", "b_"):
         if hasattr(full["estimator"], attr):
             assert np.array_equal(getattr(full["estimator"], attr), getattr(resumed["estimator"], attr))
 

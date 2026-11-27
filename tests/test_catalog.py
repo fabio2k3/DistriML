@@ -4,9 +4,9 @@ from distriml.common import catalog, dataset
 from distriml.common.errors import ContractError
 
 
-def test_four_models_with_stable_ids():
+def test_eight_models_with_stable_ids():
     defs = catalog.list_definitions()
-    assert len(defs) == 4 and len({d["model_def_id"] for d in defs}) == 4
+    assert len(defs) == 8 and len({d["model_def_id"] for d in defs}) == 8
 
 
 def test_merge_defaults_and_overrides():
