@@ -1,4 +1,8 @@
-"""Algoritmos del catálogo con scikit-learn y entrenamiento incremental.
+"""Algoritmos del catálogo y entrenamiento incremental.
+
+Los cuatro primeros usan scikit-learn (`partial_fit`); kNN, centroide más cercano, mínimos cuadrados, regresión
+softmax y regresión lineal por descenso de gradiente están implementados a mano en `models.py` (solo numpy)
+con la misma interfaz.
 
 Estado de un modelo (checkpoint y modelo final): un diccionario
     {"estimator", "feature_mean", "feature_std", "classes", "class_names"}
@@ -19,7 +23,7 @@ from sklearn.linear_model import Perceptron, SGDClassifier, SGDRegressor
 from sklearn.metrics import r2_score
 from sklearn.naive_bayes import GaussianNB
 
-from distriml.common import catalog
+from distriml.common import catalog, models
 from distriml.common.dataset import DatasetMeta
 from distriml.common.errors import bad_request
 
@@ -42,6 +46,18 @@ def _build_estimator(algorithm: str, hp: dict):
         return Perceptron(shuffle=False, random_state=seed, eta0=hp["eta0"])
     if algorithm == "gaussian_nb":
         return GaussianNB(var_smoothing=hp["var_smoothing"])
+    if algorithm == "knn_classifier":
+        return models.KNNClassifier(k=hp["k"])
+    if algorithm == "knn_regressor":
+        return models.KNNRegressor(k=hp["k"])
+    if algorithm == "nearest_centroid":
+        return models.NearestCentroid()
+    if algorithm == "least_squares":
+        return models.LeastSquares(alpha=hp["alpha"])
+    if algorithm == "softmax_regression":
+        return models.SoftmaxRegression(lr=hp["lr"], l2=hp["l2"])
+    if algorithm == "linear_regression_gd":
+        return models.LinearRegressionGD(lr=hp["lr"], l2=hp["l2"])
     raise ValueError(f"algoritmo desconocido: {algorithm}")
 
 

@@ -39,7 +39,8 @@ def test_db_actor_ping_errors_and_restart(ray_ctx, tmp_path):
     handle = start_db(cfg)
     db = RayDBProxy(handle)
     assert db.ping() == {"status": "ok"}
-    assert len(db.list_model_definitions()) == 4
+    from distriml.common import catalog
+    assert len(db.list_model_definitions()) == len(catalog.CATALOG)
     with pytest.raises(ContractError) as e:                       # ContractError cruza Ray intacto
         db.get_artifact(sha256_hex(b"no existe"))
     assert (e.value.status, e.value.reason) == (503, "artifact_unavailable")

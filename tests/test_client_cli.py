@@ -152,7 +152,9 @@ def test_commands_need_an_identity(distriml, argv):
 # ---------------------------------------------------------------------------- flujo completo
 def test_models_lists_the_catalog(ana):
     code, out, _ = ana("models")
-    assert code == 0 and {m["algorithm"] for m in as_json(out)} == {"sgd_regressor", "sgd_logistic", "perceptron", "gaussian_nb"}
+    assert code == 0 and {m["algorithm"] for m in as_json(out)} == {"sgd_regressor", "sgd_logistic", "perceptron", "gaussian_nb",
+            "knn_classifier", "knn_regressor", "nearest_centroid", "least_squares",
+            "softmax_regression", "linear_regression_gd"}
 
 
 def test_upload_uses_the_file_name_and_lists_the_dataset(ana):
