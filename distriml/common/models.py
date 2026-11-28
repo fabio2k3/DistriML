@@ -1,16 +1,19 @@
-"""Modelos base implementados a mano (solo numpy), con entrenamiento incremental por batches.
-
+"""
 Todos cumplen la interfaz que `algorithms.py` ya usa con los modelos de scikit-learn:
 
     partial_fit(X, y, classes=None) -> self      # un batch; `classes` solo en clasificación
     predict(X) -> np.ndarray
 
-Cada `partial_fit` solo AÑADE información al estado (puntos guardados, sumas o contadores), así que:
-  * el resultado no depende de cómo se parta el dataset en batches (salvo redondeo de coma flotante), y
-  * reanudar desde un checkpoint (pickle del estado) da el mismo modelo que no haberse interrumpido.
+Hay dos familias:
+  * Acumuladores (KNNClassifier, KNNRegressor, NearestCentroid, LeastSquares): cada `partial_fit` solo AÑADE
+    información al estado (puntos guardados, sumas o contadores). El resultado no depende de cómo se parta el
+    dataset en batches (salvo redondeo de coma flotante) y NO se repiten por épocas (`epochs` fijo a 1 en el
+    catálogo): volver a ver los mismos datos duplicaría puntos o estadísticas.
+  * Descenso de gradiente (SoftmaxRegression, LinearRegressionGD): cada `partial_fit` da UN paso sobre el batch.
+    Sí se repiten por épocas, y el resultado depende del orden y del tamaño de los batches (como cualquier SGD).
 
-Estos modelos NO se repiten por épocas (`epochs` fijo a 1 en el catálogo): volver a ver los mismos datos
-duplicaría puntos o estadísticas.
+En ambas, el estado completo viaja en el pickle: reanudar desde un checkpoint da exactamente el mismo modelo
+que no haberse interrumpido.
 
 X llega ya estandarizada (ver dataset.py / algorithms.py).
 """
@@ -206,3 +209,127 @@ class LeastSquares:
     def predict(self, X) -> np.ndarray:
         w = self._weights()
         return np.asarray(X, dtype=np.float64) @ w[:-1] + w[-1]
+
+
+class _GradientDescent:
+    """Base de los modelos entrenados por descenso de gradiente: pesos `W_`, sesgo `b_` y un paso por batch.
+
+    La función de pérdida es la media del batch más 0.5·l2·||W||² (el sesgo no se penaliza)."""
+
+    def __init__(self, lr: float, l2: float):
+        if not float(lr) > 0:
+            raise ValueError("lr debe ser > 0")
+        if float(l2) < 0:
+            raise ValueError("l2 debe ser >= 0")
+        self.lr, self.l2 = float(lr), float(l2)
+        self.W_: np.ndarray | None = None
+        self.b_: np.ndarray | None = None
+        self.steps_ = 0
+
+    def _descend(self, grad_W: np.ndarray, grad_b: np.ndarray) -> None:
+        self.W_ = self.W_ - self.lr * grad_W
+        self.b_ = self.b_ - self.lr * grad_b
+        self.steps_ += 1
+        if not (np.isfinite(self.W_).all() and np.isfinite(self.b_).all()):
+            # Mejor fallar que guardar un modelo de NaN: el worker lo reporta como fallo del entrenamiento.
+            raise ValueError("el entrenamiento divergió (pesos no finitos): reduce `lr`")
+
+
+class SoftmaxRegression(_GradientDescent):
+    """Regresión logística multiclase (softmax) con descenso de gradiente por mini-batches.
+
+    Pérdida: entropía cruzada media + 0.5·l2·||W||². Pesos iniciales a cero (el problema es convexo, así que
+    no hace falta aleatoriedad y el entrenamiento es determinista). Predice la clase de mayor logit."""
+
+    def __init__(self, lr: float = 0.5, l2: float = 0.0):
+        super().__init__(lr, l2)
+        self.classes_: np.ndarray | None = None
+
+    def _logits(self, X: np.ndarray) -> np.ndarray:
+        if self.W_ is None:
+            raise ValueError("el modelo no ha visto ningún batch")
+        return np.asarray(X, dtype=np.float64) @ self.W_ + self.b_
+
+    def _probabilities(self, X: np.ndarray) -> np.ndarray:
+        z = self._logits(X)
+        e = np.exp(z - z.max(axis=1, keepdims=True))           # restar el máximo evita desbordar exp
+        return e / e.sum(axis=1, keepdims=True)
+
+    def _gradient(self, X: np.ndarray, idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Gradiente de la pérdida respecto a (W, b) para un batch con etiquetas ya convertidas a índices."""
+        m = len(X)
+        err = self._probabilities(X)
+        err[np.arange(m), idx] -= 1.0                           # P - Y (Y = one-hot)
+        err /= m
+        return X.T @ err + self.l2 * self.W_, err.sum(axis=0)
+
+    def loss(self, X, y) -> float:
+        z = self._logits(X)
+        idx = _class_index(self.classes_, np.asarray(y))
+        top = z.max(axis=1, keepdims=True)
+        log_sum = np.log(np.exp(z - top).sum(axis=1)) + top[:, 0]
+        return float(np.mean(log_sum - z[np.arange(len(z)), idx]) + 0.5 * self.l2 * np.sum(self.W_ ** 2))
+
+    def partial_fit(self, X, y, classes=None):
+        X = np.asarray(X, dtype=np.float64)
+        if self.classes_ is None:
+            if classes is None:
+                raise ValueError("la primera llamada a partial_fit necesita `classes`")
+            self.classes_ = np.unique(np.asarray(classes))
+            self.W_ = np.zeros((X.shape[1], len(self.classes_)))
+            self.b_ = np.zeros(len(self.classes_))
+        idx = _class_index(self.classes_, np.asarray(y))
+        with np.errstate(over="ignore", invalid="ignore"):      # si diverge, `_descend` lo detecta y avisa con un error claro
+            self._descend(*self._gradient(X, idx))
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        return self.classes_[np.argmax(self._logits(X), axis=1)]
+
+
+class LinearRegressionGD(_GradientDescent):
+    """Regresión lineal con descenso de gradiente por mini-batches.
+
+    Pérdida: 0.5·media((ŷ - y)²) + 0.5·l2·||W||². Es el mismo modelo que `LeastSquares`, pero entrenado de forma
+    iterativa (con épocas) en vez de resolver las ecuaciones normales.
+
+    Ojo con `lr`: con batch completo el descenso converge solo si lr < 2/λmax, donde λmax es el mayor autovalor de
+    XᵀX/n. Con características estandarizadas λmax <= nº de características, así que lr < 2/d siempre es seguro;
+    por encima puede divergir (si los pesos dejan de ser finitos se lanza ValueError y el job falla)."""
+
+    def __init__(self, lr: float = 0.1, l2: float = 0.0):
+        super().__init__(lr, l2)
+
+    def _predict(self, X) -> np.ndarray:
+        if self.W_ is None:
+            raise ValueError("el modelo no ha visto ningún batch")
+        return np.asarray(X, dtype=np.float64) @ self.W_ + self.b_[0]
+
+    def _gradient(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        resid = (self._predict(X) - y) / len(X)
+        return X.T @ resid + self.l2 * self.W_, np.array([resid.sum()])
+
+    def loss(self, X, y) -> float:
+        resid = self._predict(X) - np.asarray(y, dtype=np.float64)
+        return float(0.5 * np.mean(resid ** 2) + 0.5 * self.l2 * np.sum(self.W_ ** 2))
+
+    def partial_fit(self, X, y):
+        X = np.asarray(X, dtype=np.float64)
+        if self.W_ is None:
+            self.W_ = np.zeros(X.shape[1])
+            self.b_ = np.zeros(1)
+        y = np.asarray(y, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):      # si diverge, `_descend` lo detecta y avisa con un error claro
+            self._descend(*self._gradient(X, y))
+        return self
+
+    @property
+    def coef_(self) -> np.ndarray:
+        return self.W_
+
+    @property
+    def intercept_(self) -> float:
+        return float(self.b_[0])
+
+    def predict(self, X) -> np.ndarray:
+        return self._predict(X)
