@@ -374,7 +374,8 @@ def test_stats_range_must_be_integers(db, kw):
 def test_catalog_and_ping(db):
     assert db.ping() == {"status": "ok"}
     assert {d["algorithm"] for d in db.list_model_definitions()} == {"sgd_regressor", "sgd_logistic", "perceptron", "gaussian_nb",
-            "knn_classifier", "knn_regressor", "nearest_centroid", "least_squares"}
+            "knn_classifier", "knn_regressor", "nearest_centroid", "least_squares",
+            "softmax_regression", "linear_regression_gd"}
 
 
 def test_entry_ids_are_unique_and_increasing(db):

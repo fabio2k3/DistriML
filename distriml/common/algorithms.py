@@ -1,7 +1,8 @@
 """Algoritmos del catálogo y entrenamiento incremental.
 
-Los cuatro primeros usan scikit-learn (`partial_fit`); kNN, centroide más cercano y mínimos cuadrados están
-implementados a mano en `models.py` (solo numpy) con la misma interfaz.
+Los cuatro primeros usan scikit-learn (`partial_fit`); kNN, centroide más cercano, mínimos cuadrados, regresión
+softmax y regresión lineal por descenso de gradiente están implementados a mano en `models.py` (solo numpy)
+con la misma interfaz.
 
 Estado de un modelo (checkpoint y modelo final): un diccionario
     {"estimator", "feature_mean", "feature_std", "classes", "class_names"}
@@ -53,6 +54,10 @@ def _build_estimator(algorithm: str, hp: dict):
         return models.NearestCentroid()
     if algorithm == "least_squares":
         return models.LeastSquares(alpha=hp["alpha"])
+    if algorithm == "softmax_regression":
+        return models.SoftmaxRegression(lr=hp["lr"], l2=hp["l2"])
+    if algorithm == "linear_regression_gd":
+        return models.LinearRegressionGD(lr=hp["lr"], l2=hp["l2"])
     raise ValueError(f"algoritmo desconocido: {algorithm}")
 
 

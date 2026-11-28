@@ -1,3 +1,9 @@
+"""Modelos base hechos a mano (distriml/common/models.py): kNN, centroide más cercano, mínimos cuadrados,
+regresión softmax y regresión lineal por descenso de gradiente.
+
+scikit-learn se usa AQUÍ solo como referencia para comprobar que nuestra implementación calcula lo mismo;
+el código del sistema no depende de él para estos modelos.
+"""
 import pickle
 import time
 
@@ -17,7 +23,12 @@ from tests.test_worker_wk3_wk4_wk5 import crash_after, final_model
 IRIS = (SAMPLES / "iris.csv").read_bytes()
 DIABETES = (SAMPLES / "diabetes.csv").read_bytes()
 NEW = ["knn_classifier", "knn_regressor", "nearest_centroid", "least_squares"]
-DATA = {"knn_classifier": IRIS, "nearest_centroid": IRIS, "knn_regressor": DIABETES, "least_squares": DIABETES}
+GD = ["softmax_regression", "linear_regression_gd"]       # descenso de gradiente: iteran por épocas
+ALL = NEW + GD
+DATA = {"knn_classifier": IRIS, "nearest_centroid": IRIS, "knn_regressor": DIABETES, "least_squares": DIABETES,
+        "softmax_regression": IRIS, "linear_regression_gd": DIABETES}
+# Hiperparámetros de las pruebas con BD y worker reales: pocas épocas para que sean rápidas.
+FLOW_HP = {"softmax_regression": {"batch_size": 25, "epochs": 10}, "linear_regression_gd": {"batch_size": 50, "epochs": 10}}
 NAME = {IRIS: "iris.csv", DIABETES: "diabetes.csv"}
 
 
@@ -83,7 +94,7 @@ def test_batch_size_does_not_change_the_model(algo):
         assert np.array_equal(a, b)
 
 
-@pytest.mark.parametrize("algo", NEW)
+@pytest.mark.parametrize("algo", ALL)
 def test_pickle_roundtrip_in_the_middle_keeps_the_model(algo):
     full, X, _, _ = train(algo, {"batch_size": 20})
     meta, Xs, ys, hp = prepare(algo, {"batch_size": 20})
@@ -111,14 +122,15 @@ def test_knn_state_grows_with_data_but_centroid_and_least_squares_do_not():
 
 
 # ---------------------------------------------------------------------------- casos límite y validación
-@pytest.mark.parametrize("est", [models.KNNClassifier(3), models.KNNRegressor(3), models.NearestCentroid(), models.LeastSquares()])
+@pytest.mark.parametrize("est", [models.KNNClassifier(3), models.KNNRegressor(3), models.NearestCentroid(), models.LeastSquares(),
+                                 models.SoftmaxRegression(), models.LinearRegressionGD()])
 def test_predict_before_any_batch_raises(est):
     with pytest.raises(ValueError):
         est.predict(np.zeros((1, 2)))
 
 
 def test_classifiers_need_classes_on_first_batch_and_reject_unknown_labels():
-    for est in (models.KNNClassifier(3), models.NearestCentroid()):
+    for est in (models.KNNClassifier(3), models.NearestCentroid(), models.SoftmaxRegression()):
         with pytest.raises(ValueError):
             est.partial_fit(np.zeros((2, 2)), np.array([0, 1]))
         est.partial_fit(np.zeros((2, 2)), np.array([0, 1]), classes=np.array([0, 1, 2]))
@@ -131,6 +143,10 @@ def test_invalid_constructor_arguments():
         models.KNNClassifier(0)
     with pytest.raises(ValueError):
         models.LeastSquares(alpha=-1)
+    for cls in (models.SoftmaxRegression, models.LinearRegressionGD):
+        for bad in ({"lr": 0}, {"lr": -0.1}, {"lr": float("nan")}, {"l2": -1}):
+            with pytest.raises(ValueError):
+                cls(**bad)
 
 
 def test_knn_with_k_larger_than_stored_points_uses_all_of_them():
@@ -182,7 +198,7 @@ def test_least_squares_recovers_an_exact_linear_relation():
     assert np.allclose(est.coef_, [2.0, -1.0, 0.5]) and np.isclose(est.intercept_, 4.0)
 
 
-@pytest.mark.parametrize("algo", NEW)
+@pytest.mark.parametrize("algo", ALL)
 def test_predict_validates_input_like_the_other_models(algo):
     st, _, _, _ = train(algo)
     n = len(st["feature_mean"])
@@ -195,8 +211,8 @@ def test_predict_validates_input_like_the_other_models(algo):
 # ---------------------------------------------------------------------------- catálogo
 def test_catalog_has_the_new_models_with_stable_distinct_ids():
     defs = catalog.list_definitions()
-    assert len(defs) == 8 and len({d["model_def_id"] for d in defs}) == 8
-    assert {d["algorithm"] for d in defs} >= set(NEW)
+    assert len(defs) == 10 and len({d["model_def_id"] for d in defs}) == 10
+    assert {d["algorithm"] for d in defs} >= set(ALL)
 
 
 @pytest.mark.parametrize("algo", NEW)
@@ -224,26 +240,27 @@ def test_alpha_of_least_squares_is_validated():
 
 def test_task_compatibility_of_the_new_models():
     iris, dia = dataset.analyze(IRIS), dataset.analyze(DIABETES)
-    for algo in ("knn_classifier", "nearest_centroid"):
+    for algo in ("knn_classifier", "nearest_centroid", "softmax_regression"):
         catalog.check_compatibility(catalog.BY_ALGORITHM[algo], iris)
         with pytest.raises(ContractError):
             catalog.check_compatibility(catalog.BY_ALGORITHM[algo], dia)          # etiquetas continuas
-    for algo in ("knn_regressor", "least_squares"):
+    for algo in ("knn_regressor", "least_squares", "linear_regression_gd"):
         catalog.check_compatibility(catalog.BY_ALGORITHM[algo], dia)
 
 
 # ---------------------------------------------------------------------------- BD real + worker real
 QUALITY = {"knn_classifier": ("accuracy", 0.9), "nearest_centroid": ("accuracy", 0.8),
-           "knn_regressor": ("r2", 0.3), "least_squares": ("r2", 0.4)}
+           "knn_regressor": ("r2", 0.3), "least_squares": ("r2", 0.4),
+           "softmax_regression": ("accuracy", 0.85), "linear_regression_gd": ("r2", 0.3)}
 
 
-@pytest.mark.parametrize("algo", NEW)
+@pytest.mark.parametrize("algo", ALL)
 def test_full_flow_with_real_db_and_real_worker(tmp_path, algo):
     """Subir dataset, lanzar el job, entrenar con el worker real y predecir con el modelo resultante."""
     db = make_db(tmp_path)
     data = DATA[algo]
     ds = new_dataset(db, data=data, name=NAME[data])
-    job = db.create_job(CLIENT_A, "j1", ds["dataset_id"], model_def_id(algo), {"batch_size": 25})
+    job = db.create_job(CLIENT_A, "j1", ds["dataset_id"], model_def_id(algo), FLOW_HP.get(algo, {"batch_size": 25}))
     assert db.get_job(CLIENT_A, job["job_id"])["total_batches"] > 1
     a = db.request_job("w1")
     assert run_attempt(a, "w1", db, db.cfg) == "COMPLETED"
@@ -258,7 +275,7 @@ def test_full_flow_with_real_db_and_real_worker(tmp_path, algo):
     assert isinstance(out["prediction"], (int, float))
 
 
-@pytest.mark.parametrize("algo", NEW)
+@pytest.mark.parametrize("algo", ALL)
 def test_resume_after_worker_crash_gives_the_same_model(algo):
     """Un worker muere tras confirmar 3 batches; otro continúa desde el checkpoint y el modelo es idéntico."""
     cfg = load_config(lease_duration_ms=300, renew_interval_ms=100, epsilon_ms=50, request_poll_interval_ms=20)
@@ -269,7 +286,7 @@ def test_resume_after_worker_crash_gives_the_same_model(algo):
     def seeded(rid):
         db = FakeDB(cfg)
         ds = db.create_dataset(CLIENT_A, rid, NAME[data], sha256_hex(data), len(data), data)
-        db.create_job(CLIENT_A, rid, ds["dataset_id"], model_def_id(algo), {"batch_size": 25})
+        db.create_job(CLIENT_A, rid, ds["dataset_id"], model_def_id(algo), FLOW_HP.get(algo, {"batch_size": 25}))
         return db
 
     clean = seeded("r1")
@@ -284,3 +301,181 @@ def test_resume_after_worker_crash_gives_the_same_model(algo):
     assert a2.next_batch == 4 and a2.checkpoint_sha256
     assert run_attempt(a2, "w1", db, cfg) == "COMPLETED"
     assert np.array_equal(final_model(clean)["estimator"].predict(X), final_model(db)["estimator"].predict(X))
+
+
+# ---------------------------------------------------------------------------- descenso de gradiente
+def _standardized(data, task):
+    meta = dataset.analyze(data)
+    return dataset.load_for_training(data, meta, task)
+
+
+def _numeric_gradient(model, X, y, which, eps=1e-6):
+    """Derivada numérica (diferencias centrales) de `model.loss` respecto a cada elemento de W_ o b_."""
+    param = getattr(model, which)
+    out = np.zeros_like(param)
+    for i in np.ndindex(param.shape):
+        old = param[i]
+        param[i] = old + eps
+        up = model.loss(X, y)
+        param[i] = old - eps
+        down = model.loss(X, y)
+        param[i] = old
+        out[i] = (up - down) / (2 * eps)
+    return out
+
+
+def test_softmax_gradient_matches_finite_differences():
+    rng = np.random.default_rng(0)
+    X, y = rng.normal(size=(40, 4)), rng.integers(0, 3, 40)
+    m = models.SoftmaxRegression(l2=0.3)
+    m.classes_, m.W_, m.b_ = np.arange(3), rng.normal(size=(4, 3)), rng.normal(size=3)
+    gW, gb = m._gradient(X, y)
+    assert np.allclose(gW, _numeric_gradient(m, X, y, "W_"), atol=1e-6)
+    assert np.allclose(gb, _numeric_gradient(m, X, y, "b_"), atol=1e-6)
+
+
+def test_linear_gd_gradient_matches_finite_differences():
+    rng = np.random.default_rng(1)
+    X, y = rng.normal(size=(40, 4)), rng.normal(size=40) * 10
+    m = models.LinearRegressionGD(l2=0.3)
+    m.W_, m.b_ = rng.normal(size=4), rng.normal(size=1)
+    gW, gb = m._gradient(X, y)
+    assert np.allclose(gW, _numeric_gradient(m, X, y, "W_"), atol=1e-5)
+    assert np.allclose(gb, _numeric_gradient(m, X, y, "b_"), atol=1e-5)
+
+
+def test_softmax_converges_to_the_same_solution_as_scikit_learn():
+    from sklearn.linear_model import LogisticRegression
+    X, y = _standardized(IRIS, "classification")
+    l2 = 1e-2
+    m = models.SoftmaxRegression(lr=1.0, l2=l2)
+    for _ in range(4000):                                          # batch completo: descenso de gradiente clásico
+        m.partial_fit(X, y, classes=np.unique(y))
+    ref = LogisticRegression(C=1.0 / (len(X) * l2), max_iter=20_000, tol=1e-12).fit(X, y)   # misma pérdida
+    assert np.allclose(m.W_.T, ref.coef_, atol=5e-3) and np.allclose(m.b_, ref.intercept_, atol=5e-3)
+    assert np.array_equal(m.predict(X), ref.predict(X))
+
+
+def test_linear_gd_converges_to_the_ridge_solution():
+    from sklearn.linear_model import Ridge
+    X, y = _standardized(DIABETES, "regression")
+    l2 = 1e-2
+    m = models.LinearRegressionGD(lr=0.2, l2=l2)      # con lr=0.5 diverge: el límite de este dataset es ≈ 0.50
+    for _ in range(10_000):
+        m.partial_fit(X, y)
+    ref = Ridge(alpha=len(X) * l2).fit(X, y)                       # misma pérdida: alpha = n·l2
+    assert np.allclose(m.coef_, ref.coef_, atol=1e-3) and abs(m.intercept_ - ref.intercept_) < 1e-3
+    assert np.allclose(m.predict(X), ref.predict(X), atol=1e-2)
+
+
+def test_linear_gd_reaches_the_exact_least_squares_fit():
+    """Con l2=0 el descenso de gradiente tiende a la solución exacta que calcula `LeastSquares`."""
+    X, y = _standardized(DIABETES, "regression")
+    exact = models.LeastSquares().partial_fit(X, y)
+    m = models.LinearRegressionGD(lr=0.2)
+    for _ in range(20_000):
+        m.partial_fit(X, y)
+    assert np.allclose(m.predict(X), exact.predict(X), atol=0.05)
+
+
+@pytest.mark.parametrize("cls,data,task", [(models.SoftmaxRegression, IRIS, "classification"),
+                                           (models.LinearRegressionGD, DIABETES, "regression")])
+def test_full_batch_loss_never_increases_with_a_small_step(cls, data, task):
+    X, y = _standardized(data, task)
+    m = cls(lr=0.05)
+    kw = {"classes": np.unique(y)} if task == "classification" else {}
+    m.partial_fit(X, y, **kw)
+    losses = [m.loss(X, y)]
+    for _ in range(60):
+        m.partial_fit(X, y, **kw)
+        losses.append(m.loss(X, y))
+    assert all(b <= a + 1e-12 for a, b in zip(losses, losses[1:])) and losses[-1] < losses[0]
+
+
+@pytest.mark.parametrize("algo", GD)
+def test_gradient_descent_is_deterministic(algo):
+    a, X, _, _ = train(algo, {"batch_size": 30, "epochs": 4})
+    b, _, _, _ = train(algo, {"batch_size": 30, "epochs": 4})
+    assert np.array_equal(a["estimator"].W_, b["estimator"].W_) and np.array_equal(a["estimator"].b_, b["estimator"].b_)
+    assert a["estimator"].steps_ == b["estimator"].steps_ > 1
+
+
+@pytest.mark.parametrize("algo", GD)
+def test_gradient_descent_models_do_use_epochs(algo):
+    md = catalog.BY_ALGORITHM[algo]
+    assert "epochs" in md.default_hyperparams and "epochs" not in md.fixed_hyperparams
+    one, _, _, hp1 = train(algo, {"batch_size": 50, "epochs": 1})
+    three, _, _, hp3 = train(algo, {"batch_size": 50, "epochs": 3})
+    assert three["estimator"].steps_ == 3 * one["estimator"].steps_
+    assert not np.array_equal(one["estimator"].W_, three["estimator"].W_)
+
+
+@pytest.mark.parametrize("algo", GD)
+def test_default_hyperparameters_learn_something_useful(algo):
+    state, X, y, _ = train(algo)
+    metrics = algorithms.evaluate_full(state, algo, X, y)
+    assert metrics["accuracy"] > 0.9 if algo == "softmax_regression" else metrics["r2"] > 0.45, metrics
+
+
+@pytest.mark.parametrize("algo", GD)
+def test_lr_and_l2_are_validated(algo):
+    md = catalog.BY_ALGORITHM[algo]
+    assert catalog.merge_hyperparams(md, {"lr": 0.2, "l2": 0.01})["lr"] == 0.2
+    for bad in ({"lr": 0}, {"lr": -1}, {"lr": float("nan")}, {"lr": 2e3}, {"l2": -0.1}, {"l2": 2e6}, {"lr": "0.1"}):
+        with pytest.raises(ContractError):
+            catalog.merge_hyperparams(md, bad)
+
+
+def test_softmax_does_not_overflow_with_huge_features():
+    X, y = _standardized(IRIS, "classification")
+    m = models.SoftmaxRegression(lr=0.5)
+    m.partial_fit(X * 1e3, y, classes=np.unique(y))
+    assert np.isfinite(m.W_).all() and np.isfinite(m._probabilities(X * 1e3)).all()
+
+
+def test_softmax_handles_classes_not_seen_in_the_first_batches():
+    X, y = _standardized(IRIS, "classification")
+    order = np.argsort(y, kind="stable")                           # primero solo la clase 0, luego la 1...
+    m = models.SoftmaxRegression(lr=0.5)
+    for lo in range(0, len(X), 25):
+        sel = order[lo:lo + 25]
+        m.partial_fit(X[sel], y[sel], classes=np.unique(y))
+    assert set(np.unique(m.predict(X))) <= set(np.unique(y)) and np.isfinite(m.W_).all()
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")      # divergir a propósito desborda float64
+def test_the_stable_step_limit_of_linear_gd_is_two_over_the_largest_eigenvalue():
+    """Con batch completo, el descenso converge si lr < 2/λmax (λmax: mayor autovalor de XᵀX/n) y diverge si no."""
+    X, y = _standardized(DIABETES, "regression")
+    limit = 2.0 / np.linalg.eigvalsh(X.T @ X / len(X)).max()
+    stable, unstable = models.LinearRegressionGD(lr=0.9 * limit), models.LinearRegressionGD(lr=1.1 * limit)
+    for _ in range(300):
+        stable.partial_fit(X, y)
+    assert np.isfinite(stable.W_).all() and stable.loss(X, y) < 0.5 * np.var(y)
+    with pytest.raises(ValueError, match="divergió"):
+        for _ in range(20_000):
+            unstable.partial_fit(X, y)
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")      # divergir a propósito desborda float64
+def test_linear_gd_divergence_is_detected_instead_of_saving_nans():
+    X, y = _standardized(DIABETES, "regression")
+    m = models.LinearRegressionGD(lr=1e3)
+    with pytest.raises(ValueError, match="divergió"):
+        for _ in range(500):
+            m.partial_fit(X, y)
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")      # divergir a propósito desborda float64
+def test_a_diverging_job_is_reported_as_a_worker_error_not_saved():
+    """lr exagerado -> el worker reporta fallo del entrenamiento (cuenta para max_attempts) y no sube ningún modelo."""
+    cfg = load_config(lease_duration_ms=2000, renew_interval_ms=500, epsilon_ms=50, request_poll_interval_ms=20)
+    db = FakeDB(cfg)
+    ds = db.create_dataset(CLIENT_A, "r1", "diabetes.csv", sha256_hex(DIABETES), len(DIABETES), DIABETES)
+    job = db.create_job(CLIENT_A, "r1", ds["dataset_id"], model_def_id("linear_regression_gd"),
+                        {"lr": 1000.0, "epochs": 50, "batch_size": 20})
+    a = db.request_job("w0")
+    assert run_attempt(a, "w0", db, cfg) == "FAILED"
+    view = db.get_job(CLIENT_A, job["job_id"])
+    assert view["estado"] == C.PENDIENTE and view["attempts_count"] == 1 and not view.get("model_id")
+    assert view["attempts"][0]["revoke_reason"] == C.WORKER_ERROR

@@ -165,9 +165,11 @@ def test_resubmitting_with_the_same_request_id_does_not_duplicate_work(system):
     ("d", "nearest_centroid", "iris_names.csv", [6.9, 3.1, 5.4, 2.1], ("accuracy", 0.8)),
     ("e", "knn_regressor", "diabetes.csv", [0.0] * 10, ("r2", 0.3)),
     ("f", "least_squares", "diabetes.csv", [0.0] * 10, ("r2", 0.4)),
+    ("0", "softmax_regression", "iris_names.csv", [6.9, 3.1, 5.4, 2.1], ("accuracy", 0.85)),
+    ("7", "linear_regression_gd", "diabetes.csv", [0.0] * 10, ("r2", 0.3)),
 ])
 def test_hand_made_models_work_through_the_whole_stack(system, user, algo, sample, features, floor):
-    """kNN, centroide y mínimos cuadrados: sus clases viajan por pickle entre procesos de Ray distintos."""
+    """Modelos hechos a mano (kNN, centroide, mínimos cuadrados, softmax, regresión por GD): sus clases viajan por pickle entre procesos de Ray distintos."""
     c = new_client(system, user)
     try:
         ds = c.upload_dataset(sample, (SAMPLES / sample).read_bytes())
@@ -179,7 +181,7 @@ def test_hand_made_models_work_through_the_whole_stack(system, user, algo, sampl
         assert model["metrics"][metric] > minimum, model["metrics"]
         res = c.predict(model["model_id"], features)
         assert res["version_id"] == model["canonical_version_id"]
-        if algo in ("knn_classifier", "nearest_centroid"):
+        if algo in ("knn_classifier", "nearest_centroid", "softmax_regression"):
             assert res["label"] == NAMES[res["prediction"]]
     finally:
         c.close()
